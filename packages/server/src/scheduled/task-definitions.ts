@@ -10,6 +10,7 @@ export const WORKSPACE_EVENT_ACTIVATION_TASK = 'activate-workspace-event';
 export const INTERACTIVE_EVENT_CARD_REFRESH_TASK =
   'refresh-interactive-event-card';
 export const AUTOMATION_REACTION_TASK = 'automation-reaction';
+export const AUTOMATION_SCRIPT_TASK = 'automation-script';
 export const AUTOMATION_REACTION_TASK_QUEUE =
   `task:${AUTOMATION_REACTION_TASK}`;
 
@@ -20,8 +21,8 @@ export const AUTOMATION_REACTION_TASK_QUEUE =
  * during a rolling deploy. Existing task names stay on the shared lane.
  */
 export function taskQueueName(name: string): string {
-  return name === AUTOMATION_REACTION_TASK
-    ? AUTOMATION_REACTION_TASK_QUEUE
+  return name === AUTOMATION_REACTION_TASK || name === AUTOMATION_SCRIPT_TASK
+    ? `task:${name}`
     : 'task';
 }
 
@@ -29,6 +30,7 @@ export function isTransactionalTaskName(name: string): boolean {
   return (
     name === WORKSPACE_EVENT_ACTIVATION_TASK ||
     name === INTERACTIVE_EVENT_CARD_REFRESH_TASK ||
-    name === AUTOMATION_REACTION_TASK
+    name === AUTOMATION_REACTION_TASK ||
+    name === AUTOMATION_SCRIPT_TASK
   );
 }

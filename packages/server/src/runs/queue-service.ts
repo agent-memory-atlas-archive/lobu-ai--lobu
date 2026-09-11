@@ -15,6 +15,7 @@ import {
   resolvedEventExecution,
   type AutomationEventTrigger,
   type AutomationWorkspaceEventTrigger,
+  type AutomationScriptExecutor,
 } from '@lobu/core/contracts/tools/manage-automations';
 import type { ConnectorTriggerSignal } from '@lobu/connector-sdk';
 import {
@@ -61,6 +62,8 @@ export type AutomationActivationSignal =
   | WorkspaceEventTriggerSignal;
 
 export interface AutomationRunPayload {
+  /** Execution code is pinned with the run, never reloaded from a live Automation on retry. */
+  executor?: AutomationScriptExecutor;
   automation_id: number;
   /**
    * The managed agent executing this run. Absent for device-executed runs
@@ -666,7 +669,7 @@ async function createAutomationRunWithClient(
   // Snapshot the automation's current_version_id at run-creation time so the
   // entire run uses a fixed version even if the group is edited mid-run.
   const versionRows = await sql`
-    SELECT current_version_id
+    SELECT current_version_id, execution_config->'executor' AS executor
     FROM automations
     WHERE id = ${params.automationId}
     LIMIT 1
@@ -697,6 +700,7 @@ async function createAutomationRunWithClient(
     window_end: params.windowEnd,
     dispatch_source: params.dispatchSource,
     version_id: snapshotVersionId,
+    ...(versionRows[0]?.executor ? { executor: versionRows[0].executor as AutomationRunPayload['executor'] } : {}),
     device_worker_id: normalizedDeviceWorkerId,
     agent_kind: normalizedAgentKind,
     source_fingerprint: params.sourceFingerprint,
@@ -1021,7 +1025,7 @@ export async function createAutomationEventRun(
     }
 
     const versionRows = await tx`
-      SELECT current_version_id
+      SELECT current_version_id, execution_config->'executor' AS executor
       FROM automations
       WHERE id = ${params.automationId}
       LIMIT 1
@@ -1036,6 +1040,7 @@ export async function createAutomationEventRun(
       window_end: signalWindowEnd,
       dispatch_source: 'event',
       version_id: versionId,
+      ...(versionRows[0]?.executor ? { executor: versionRows[0].executor as AutomationRunPayload['executor'] } : {}),
       device_worker_id: params.deviceWorkerId ?? null,
       agent_kind: params.agentKind ?? null,
       trigger_signal: params.signal,
