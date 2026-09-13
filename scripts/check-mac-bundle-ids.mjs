@@ -12,20 +12,23 @@
  * app, it installs a second copy beside it and strands the original with no
  * update path. That is the whole reason the Release value is pinned here.
  *
- * (It is NOT what keys the URL scheme or the Keychain: Info.plist registers the
- * static scheme `owletto` and the bundle id appears only as CFBundleURLName,
- * and KeychainTokenStore hardcodes the service `ai.lobu.mac`. Isolating the
- * Debug build's stored secrets is a separate, context-keyed mechanism.)
+ * (It is NOT what keys the URL scheme or the Keychain. The scheme comes from the
+ * separate `LOBU_URL_SCHEME` build setting — `lobu` for Release, `lobu-debug`
+ * for Debug — and the bundle id reaches Info.plist only as CFBundleURLName.
+ * KeychainTokenStore hardcodes its own service literal, isolated by `#if DEBUG`.
+ * Since this cutover those literals read the same as the bundle ids, but neither
+ * derives from the other: renaming the bundle id again would leave the stored
+ * secrets exactly where they are.)
  *
  * The identity is pinned PER BUILD CONFIGURATION rather than globally:
  *
- *   Release  must be exactly `com.owletto.mac`.
- *   Debug    may be `com.owletto.mac` or the build-scoped
- *            `com.owletto.mac.debug`, so a developer build is a distinct app to
+ *   Release  must be exactly `ai.lobu.mac`.
+ *   Debug    may be `ai.lobu.mac` or the build-scoped
+ *            `ai.lobu.mac.debug`, so a developer build is a distinct app to
  *            macOS and installs beside the Release app instead of replacing it.
  *
  * Why per-configuration and not "the set of distinct values must be
- * {com.owletto.mac, com.owletto.mac.debug}": a set cannot tell
+ * {ai.lobu.mac, ai.lobu.mac.debug}": a set cannot tell
  * `Release=mac, Debug=mac.debug` apart from the swapped
  * `Release=mac.debug, Debug=mac`, and the swapped form ships a release DMG
  * under the debug identity — precisely the break this gate exists to stop.
@@ -37,8 +40,8 @@
 
 import { readFileSync } from "node:fs";
 
-const EXPECTED_RELEASE_BUNDLE_ID = "com.owletto.mac";
-const EXPECTED_DEBUG_BUNDLE_ID = "com.owletto.mac.debug";
+const EXPECTED_RELEASE_BUNDLE_ID = "ai.lobu.mac";
+const EXPECTED_DEBUG_BUNDLE_ID = "ai.lobu.mac.debug";
 const DEFAULT_PBXPROJ =
   "packages/owletto/apps/mac/Owletto.xcodeproj/project.pbxproj";
 
