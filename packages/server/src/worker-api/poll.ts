@@ -78,6 +78,10 @@ import {
 } from './device-manifests';
 import type { RunOutcome } from '../runs/run-outcome';
 import {
+  clientFloorMessage,
+  meetsClientVersionFloor,
+} from './client-version-floor';
+import {
   type ConnectorClaimContext,
   connectorClaimLaneSql,
 } from './connector-claim-lanes';
@@ -373,6 +377,20 @@ export async function pollWorkerJob(c: Context<{ Bindings: Env }>) {
   // below, so platform binding / capability authorization / org-scoped claiming
   // all apply exactly as for a signed-in device.
   const isUserScopedWorker = c.var.workerAuthMode === 'user' || anonLocalUserId != null;
+  // First-party client version floor (see client-version-floor.ts). Same
+  // user-scoped predicate as every check below, so re-anchored anonymous
+  // local polls are gated too; fleet workers are never gated. Below-floor
+  // user devices fail LOUD here, before claiming anything, so an outdated
+  // client can never silently misbehave in the claim lanes.
+  if (isUserScopedWorker && !meetsClientVersionFloor(platform, app_version)) {
+    return c.json(
+      {
+        error: 'upgrade_required',
+        error_description: clientFloorMessage(platform),
+      },
+      409
+    );
+  }
   // Effective device identity: the token's user/org when user-scoped, else the
   // re-anchored local owner.
   const effectiveWorkerUserId = c.var.workerUserId ?? anonLocalUserId;
