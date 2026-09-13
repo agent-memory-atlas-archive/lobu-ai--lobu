@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
 	clientFloorMessage,
 	meetsClientVersionFloor,
@@ -62,6 +62,52 @@ describe("client version floor", () => {
 		process.env.MIN_CLIENT_VERSION = "someday,macos,=1.2.3,macos=bogus";
 		expect(meetsClientVersionFloor("macos", "0.0.1")).toBe(true);
 		expect(meetsClientVersionFloor("macos", null)).toBe(true);
+	});
+
+	test("one malformed entry does not disarm the valid ones", () => {
+		// The dangerous shape: the variable looks set for three platforms, but
+		// `macos=19.2` is two parts and drops out. chrome-extension must still
+		// enforce, and macos must be reported as enforcing nothing rather than
+		// quietly appearing covered.
+		process.env.MIN_CLIENT_VERSION =
+			"chrome-extension=0.6.0,macos=19.2,headless=19.0.0";
+		expect(meetsClientVersionFloor("chrome-extension", "0.5.9")).toBe(false);
+		expect(meetsClientVersionFloor("headless", "18.0.0")).toBe(false);
+		expect(meetsClientVersionFloor("macos", "0.0.1")).toBe(true);
+	});
+
+	test("the warn names the dropped entries in the rendered line", () => {
+		// The default console transport DROPS a leading metadata object, so the
+		// entries have to reach the rendered line. An operator who is told "some
+		// entry dropped" without being told WHICH is back at the silent
+		// misconfiguration this warn exists to break.
+		const lines: string[] = [];
+		const spy = spyOn(console, "warn").mockImplementation((line: unknown) => {
+			lines.push(String(line));
+		});
+		try {
+			process.env.MIN_CLIENT_VERSION = "macos=19.2,headless=19.0.0";
+			expect(meetsClientVersionFloor("macos", "0.0.1")).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+		const rendered = lines.join("\n");
+		expect(rendered).toContain("macos=19.2");
+		expect(rendered).toContain("headless");
+	});
+
+	test("a changed value takes effect immediately despite the parse cache", () => {
+		// envFloors() memoizes on the raw string because it runs on every device
+		// poll. Keyed on anything coarser (a boolean "parsed once") a floor change
+		// would never take effect until restart.
+		process.env.MIN_CLIENT_VERSION = "macos=19.2.0";
+		expect(meetsClientVersionFloor("macos", "19.0.0")).toBe(false);
+
+		process.env.MIN_CLIENT_VERSION = "macos=18.0.0";
+		expect(meetsClientVersionFloor("macos", "19.0.0")).toBe(true);
+
+		delete process.env.MIN_CLIENT_VERSION;
+		expect(meetsClientVersionFloor("macos", "0.0.1")).toBe(true);
 	});
 
 	test("messages name the client when known", () => {
