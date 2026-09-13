@@ -193,6 +193,10 @@ Memory:
       "Bootstrap a re-appliable project from an existing org (defaults to active session)"
     )
     .option("--url <url>", "Server URL override (with --from-org)")
+    .option(
+      "--skip-install",
+      "Scaffold files without installing dependencies (run npm install or bun install later)"
+    )
     .action(
       async (
         name: string | undefined,
@@ -455,10 +459,20 @@ Memory:
       .command("whoami")
       .description("Show current user and linked agent")
       .option("--json", "Emit machine-readable session JSON (for Owletto Mac)")
-  ).action(async (options: { context?: string; json?: boolean }) => {
-    const { whoamiCommand } = await import("./commands/whoami.js");
-    await whoamiCommand(options);
-  });
+      .option(
+        "--include-tokens",
+        "Include raw auth tokens (trusted local clients only)"
+      )
+  ).action(
+    async (options: {
+      context?: string;
+      json?: boolean;
+      includeTokens?: boolean;
+    }) => {
+      const { whoamiCommand } = await import("./commands/whoami.js");
+      await whoamiCommand(options);
+    }
+  );
 
   // ─── token ──────────────────────────────────────────────────────────
   const token = withCommonOpts(

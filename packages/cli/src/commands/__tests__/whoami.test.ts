@@ -51,6 +51,8 @@ describe("whoamiCommand --json", () => {
     expect(result.apiUrl).toBe("https://app.lobu.ai/api/v1");
     expect(result.local).toBe(false);
     expect(result.organizations).toEqual([]);
+    expect(result.hasAccessToken).toBe(false);
+    expect(result.hasWorkerToken).toBe(false);
   });
 
   test("emits session fields after refresh", async () => {
@@ -79,11 +81,31 @@ describe("whoamiCommand --json", () => {
     expect(result.email).toBe("user@example.com");
     expect(result.name).toBe("Test User");
     expect(result.userId).toBe("user-123");
-    expect(result.accessToken).toBe("session-token");
-    expect(result.workerToken).toBe("session-token");
+    expect(result.hasAccessToken).toBe(true);
+    expect(result.hasWorkerToken).toBe(true);
+    expect(result.accessToken).toBeUndefined();
+    expect(result.workerToken).toBeUndefined();
     expect(result.expiresAt).toBe(1_700_000_000_000);
     expect(result.orgSlug).toBe("acme");
     expect(result.organizations).toEqual([{ slug: "acme", name: "Acme Inc" }]);
+  });
+
+  test("emits raw tokens only when explicitly requested", async () => {
+    spyOn(internal, "refreshCredentials").mockResolvedValue({
+      accessToken: "session-token",
+      localWorkerToken: "worker-pat",
+      oauth: {
+        clientId: "client-id",
+        tokenEndpoint: "https://issuer.example.com/token",
+      },
+    });
+    spyOn(internal, "getAgentApiToken").mockResolvedValue("worker-pat");
+
+    await whoamiCommand({ json: true, includeTokens: true });
+
+    const result = parseJsonOutput();
+    expect(result.accessToken).toBe("session-token");
+    expect(result.workerToken).toBe("worker-pat");
   });
 
   test("uses worker PAT on loopback and marks local=true", async () => {
@@ -107,8 +129,10 @@ describe("whoamiCommand --json", () => {
 
     const result = parseJsonOutput();
     expect(result.local).toBe(true);
-    expect(result.accessToken).toBe("session-token");
-    expect(result.workerToken).toBe("worker-pat");
+    expect(result.hasAccessToken).toBe(true);
+    expect(result.hasWorkerToken).toBe(true);
+    expect(result.accessToken).toBeUndefined();
+    expect(result.workerToken).toBeUndefined();
     expect(result.loggedIn).toBe(true);
   });
 
@@ -171,7 +195,8 @@ describe("whoamiCommand --json", () => {
 
     const result = parseJsonOutput();
     expect(result.loggedIn).toBe(true);
-    expect(result.workerToken).toBe("fallback-token");
+    expect(result.hasWorkerToken).toBe(true);
+    expect(result.workerToken).toBeUndefined();
   });
 
   test("tolerates listOrganizations failure", async () => {

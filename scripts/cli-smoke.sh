@@ -320,7 +320,7 @@ expect_fail_grep "lobu start alias -> run handler" "already in use" "$PROJ" star
 
 # Trigger loopback auth (local-init) + resolve the bootstrap org slug.
 runlobu "$PROJ" whoami -c local
-ORG="$( ( cd "$PROJ" && node "$LOBU_BIN" org current -c local 2>/dev/null ) | grep -oE '[a-z0-9][a-z0-9-]*' | grep -vE '^local$|^org$|^for$|^context$|^current$|^no$|^active$|^set$' | tail -1 )"
+ORG="$( ( cd "$PROJ" && node "$LOBU_BIN" whoami --json -c local 2>/dev/null ) | node -e 'let s=""; process.stdin.on("data", d => s += d).on("end", () => { const parsed=JSON.parse(s); const slug=parsed.orgSlug ?? parsed.personalOrgSlug; if (slug) process.stdout.write(slug); });' )"
 [ -n "$ORG" ] || die "could not resolve the local org slug (lobu org current -c local)"
 echo ">> resolved local org: $ORG"
 
@@ -330,10 +330,10 @@ echo ">> resolved local org: $ORG"
 note "identity / status / token"
 expect_grep "lobu whoami -c local" "Context" "$PROJ" whoami -c local
 runlobu "$PROJ" whoami --json -c local
-if [ "$RC" -eq 0 ] && grep -q '"loggedIn":true' "$OUT" && grep -q '"workerToken"' "$OUT"; then
-  pass "lobu whoami --json (loggedIn + workerToken)"
+if [ "$RC" -eq 0 ] && grep -q '"loggedIn":true' "$OUT" && grep -q '"hasWorkerToken":true' "$OUT"; then
+  pass "lobu whoami --json (loggedIn + hasWorkerToken)"
 else
-  softfail "lobu whoami --json (exit=$RC, missing loggedIn/workerToken)"
+  softfail "lobu whoami --json (exit=$RC, missing loggedIn/hasWorkerToken)"
 fi
 expect_grep "lobu status -c local" "API:" "$PROJ" status -c local
 expect_grep "lobu token -c local" "Token" "$PROJ" token -c local
