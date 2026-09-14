@@ -360,22 +360,47 @@ export async function unregisterConnectorWebhook(params: {
  * registered webhook (so the route can 404 rather than accept blindly).
  */
 export async function resolveConnectionWebhookConfig(
-  config: Record<string, unknown> | null | undefined
+  config: Record<string, unknown> | null | undefined,
+  connectorKey: string
 ): Promise<Record<string, unknown> | null> {
   const c = (config ?? {}) as Record<string, unknown> & ConnectionWebhookState;
-  if (!c.webhook_signature_secret && !c.webhook_callback_token && !c.webhook_external_id) {
+  // Documented generic-webhook schema keys (packages/connectors/src/webhook.ts
+  // optionsSchema: token, dedupeHeader, …) fall back when the provider-
+  // registration webhook_* keys are absent — otherwise a connection created
+  // via the documented schema 404s forever on ingest. Gated to the webhook
+  // connector: any other connector storing a plain `token` config key must
+  // keep 404ing rather than silently becoming a bearer-auth receiver.
+  // `connectorKey` is required (no permissive default) so a future caller
+  // cannot omit it and silently widen the fallback.
+  const documentedKeys = connectorKey === 'webhook';
+  const registeredToken = c.webhook_callback_token;
+  const documentedToken =
+    documentedKeys && typeof c.token === 'string' ? c.token : undefined;
+  const token = registeredToken ?? documentedToken;
+  const dedupeHeader =
+    c.webhook_dedupe_header ?? (documentedKeys && typeof c.dedupeHeader === 'string' ? c.dedupeHeader : undefined);
+  if (!c.webhook_signature_secret && !token && !c.webhook_external_id) {
     return null;
   }
   return {
     platform: 'webhook',
-    ...(c.webhook_callback_token
-      ? { token: c.webhook_callback_token, allowQueryAuth: true }
+    // Provider-registered webhooks always allow query auth (pre-existing).
+    // Documented-schema tokens carry only the connection's own opt-in —
+    // forcing true would authenticate `?token=` URLs the owner never opted
+    // into (tokens leak via proxy logs and browser history).
+    ...(registeredToken ? { token: registeredToken, allowQueryAuth: true } : {}),
+    ...(!registeredToken && documentedToken
+      ? {
+          token: documentedToken,
+          allowQueryAuth:
+            c.allowQueryAuth === true || c.allowQueryAuth === 'true',
+        }
       : {}),
     ...(c.webhook_signature_secret ? { signatureSecret: c.webhook_signature_secret } : {}),
     ...(c.webhook_signature_header ? { signatureHeader: c.webhook_signature_header } : {}),
     ...(c.webhook_algorithm ? { algorithm: c.webhook_algorithm } : {}),
     ...(c.webhook_signature_prefix ? { signaturePrefix: c.webhook_signature_prefix } : {}),
-    ...(c.webhook_dedupe_header ? { dedupeHeader: c.webhook_dedupe_header } : {}),
+    ...(dedupeHeader ? { dedupeHeader } : {}),
     // Carry through any ingest-shaping the connection set (semantic type, etc.).
     ...(typeof c.semanticType === 'string' ? { semanticType: c.semanticType } : {}),
     ...(typeof c.titlePath === 'string' ? { titlePath: c.titlePath } : {}),

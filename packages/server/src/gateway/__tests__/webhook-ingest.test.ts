@@ -1642,6 +1642,253 @@ describe("connector-connection webhook bridge (connections table)", () => {
 		expect(count).toBe(0);
 	});
 
+	test("a bridged generic webhook (documented schema keys) activates delivery.received", async () => {
+		await seedAgentRow(AGENT, { organizationId: ORG });
+		const { manager } = await buildManager();
+		const { createConnectionWebhookRoutes } = await import(
+			"../routes/public/connections.js"
+		);
+		const { getDb } = await import("../../db/client.js");
+		// Documented optionsSchema keys only (token/dedupeHeader) — no
+		// webhook_* registration keys. resolveConnectionWebhookConfig must
+		// accept both or ingest 404s forever (H2).
+		const docToken = "bridged-doc-token-0123456789abcdef0123456789";
+		const inserted = (await getDb()`
+			INSERT INTO connections (organization_id, connector_key, slug, status, config)
+			VALUES (${ORG}, 'webhook', ${`bridged-doc-${Date.now()}-${Math.random()}`},
+				'active', ${getDb().json({ token: docToken, semanticType: "alert" })})
+			RETURNING id
+		`) as Array<{ id: number }>;
+		const id = String(inserted[0].id);
+		const automationId = await seedWebhookEventAutomation({
+			connectionId: Number(id),
+		});
+		const app = createConnectionWebhookRoutes(manager);
+		const raw = JSON.stringify({ hello: "bridged" });
+		const response = await app.fetch(
+			new Request(`http://gateway.test/api/v1/webhooks/${id}`, {
+				method: "POST",
+				body: raw,
+				headers: {
+					"content-type": "application/json",
+					authorization: `Bearer ${docToken}`,
+				},
+			}),
+		);
+		expect(response.status).toBe(202);
+		const rows = await eventRows(id);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].connection_id).toBe(Number(id));
+		const runs = await getDb()<{ id: number }>`
+			SELECT id FROM runs
+			WHERE automation_id = ${automationId}
+			  AND run_type = 'automation'
+		`;
+		expect(runs.length).toBeGreaterThan(0);
+	});
+
+	test("a non-webhook connector storing a plain token key still 404s", async () => {
+		// The documented-key fallback is gated to connector_key 'webhook': any
+		// other connector with a `token` config key must not silently become a
+		// bearer-auth receiver.
+		await seedAgentRow(AGENT, { organizationId: ORG });
+		const { manager } = await buildManager();
+		const { createConnectionWebhookRoutes } = await import(
+			"../routes/public/connections.js"
+		);
+		const { getDb } = await import("../../db/client.js");
+		const otherToken = "linear-plain-token-0123456789abcdef0123456789";
+		const inserted = (await getDb()`
+			INSERT INTO connections (organization_id, connector_key, slug, status, config)
+			VALUES (${ORG}, 'linear', ${`linear-plain-${Date.now()}-${Math.random()}`},
+				'active', ${getDb().json({ token: otherToken })})
+			RETURNING id
+		`) as Array<{ id: number }>;
+		const id = String(inserted[0].id);
+		// Guard against a vacuous pass: the row must really exist, so the 404
+		// below proves the gate rejected it rather than the seed failing.
+		const sql = getDb();
+		const [seeded] = await sql<{ id: number }>`
+			SELECT id FROM connections WHERE id = ${Number(id)}
+		`;
+		expect(Number(seeded?.id)).toBe(Number(id));
+		const app = createConnectionWebhookRoutes(manager);
+		const response = await app.fetch(
+			new Request(`http://gateway.test/api/v1/webhooks/${id}`, {
+				method: "POST",
+				body: JSON.stringify({ hello: "nope" }),
+				headers: {
+					"content-type": "application/json",
+					authorization: `Bearer ${otherToken}`,
+				},
+			}),
+		);
+		expect(response.status).toBe(404);
+		expect(await eventRows(id)).toHaveLength(0);
+	});
+
+	test("a bridged delivery ignores an unrelated legacy numeric-stable-id projection", async () => {
+		// A legacy generic webhook with numeric stable id N owns the
+		// agentconn-<N> projection. A bridged connector connection that happens
+		// to have connections.id N must activate its OWN automations, never
+		// the legacy row's.
+		await seedAgentRow(AGENT, { organizationId: ORG });
+		const { manager } = await buildManager();
+		const { createConnectionWebhookRoutes } = await import(
+			"../routes/public/connections.js"
+		);
+		const { getDb } = await import("../../db/client.js");
+		const docToken = "bridged-collide-token-0123456789abcdef0123456789";
+		const inserted = (await getDb()`
+			INSERT INTO connections (organization_id, connector_key, slug, status, config)
+			VALUES (${ORG}, 'webhook', ${`bridged-collide-${Date.now()}-${Math.random()}`},
+				'active', ${getDb().json({ token: docToken, semanticType: "alert" })})
+			RETURNING id
+		`) as Array<{ id: number }>;
+		const id = String(inserted[0].id);
+		// Decoy: legacy projection slug for the same numeric string, pointing
+		// at a different row.
+		const [decoy] = (await getDb()`
+			INSERT INTO connections (organization_id, connector_key, slug, status, config)
+			VALUES (${ORG}, 'webhook', ${`agentconn-${id}`},
+				'active', ${getDb().json({})})
+			RETURNING id
+		`) as Array<{ id: number }>;
+		const bridgedAutomationId = await seedWebhookEventAutomation({
+			connectionId: Number(id),
+		});
+		const decoyAutomationId = await seedWebhookEventAutomation({
+			connectionId: Number(decoy.id),
+		});
+		const app = createConnectionWebhookRoutes(manager);
+		const response = await app.fetch(
+			new Request(`http://gateway.test/api/v1/webhooks/${id}`, {
+				method: "POST",
+				body: JSON.stringify({ hello: "collide" }),
+				headers: {
+					"content-type": "application/json",
+					authorization: `Bearer ${docToken}`,
+				},
+			}),
+		);
+		expect(response.status).toBe(202);
+		const rows = await eventRows(id);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].connection_id).toBe(Number(id));
+		const sql = getDb();
+		const [{ count: bridgedCount }] = await sql<{ count: number }>`
+			SELECT count(*)::int AS count FROM runs
+			WHERE automation_id = ${bridgedAutomationId}
+			  AND run_type = 'automation'
+		`;
+		const [{ count: decoyCount }] = await sql<{ count: number }>`
+			SELECT count(*)::int AS count FROM runs
+			WHERE automation_id = ${decoyAutomationId}
+			  AND run_type = 'automation'
+		`;
+		expect(bridgedCount).toBeGreaterThan(0);
+		expect(decoyCount).toBe(0);
+	});
+
+	test("query-string auth honors the connection opt-in, nothing more", async () => {
+		// Documented-schema tokens must not authenticate `?token=` unless the
+		// connection set allowQueryAuth — tokens leak via proxy logs and
+		// browser history, so the default is Bearer-header only.
+		await seedAgentRow(AGENT, { organizationId: ORG });
+		const { manager } = await buildManager();
+		const { createConnectionWebhookRoutes } = await import(
+			"../routes/public/connections.js"
+		);
+		const { getDb } = await import("../../db/client.js");
+		const sql = getDb();
+		async function seedDocConnection(
+			name: string,
+			config: Record<string, unknown>
+		): Promise<string> {
+			const inserted = (await sql`
+				INSERT INTO connections (organization_id, connector_key, slug, status, config)
+				VALUES (${ORG}, 'webhook', ${`${name}-${Date.now()}-${Math.random()}`},
+					'active', ${sql.json(config)})
+				RETURNING id
+			`) as Array<{ id: number }>;
+			return String(inserted[0].id);
+		}
+		const plainToken = "query-optout-token-0123456789abcdef0123456789";
+		const plainId = await seedDocConnection("query-optout", {
+			token: plainToken,
+			semanticType: "alert",
+		});
+		const optInToken = "query-optin-token-0123456789abcdef0123456789";
+		const optInId = await seedDocConnection("query-optin", {
+			token: optInToken,
+			allowQueryAuth: true,
+			semanticType: "alert",
+		});
+		const app = createConnectionWebhookRoutes(manager);
+		const queryDelivery = (id: string, token: string) =>
+			app.fetch(
+				new Request(
+					`http://gateway.test/api/v1/webhooks/${id}?token=${token}`,
+					{
+						method: "POST",
+						body: JSON.stringify({ hello: "query" }),
+						headers: { "content-type": "application/json" },
+					}
+				)
+			);
+		// No opt-in: query token rejected even though the Bearer token is valid.
+		const denied = await queryDelivery(plainId, plainToken);
+		expect(denied.status).toBe(401);
+		expect(await eventRows(plainId)).toHaveLength(0);
+		// Opted in: query token accepted.
+		const allowed = await queryDelivery(optInId, optInToken);
+		expect(allowed.status).toBe(202);
+		expect(await eventRows(optInId)).toHaveLength(1);
+	});
+
+	test("a grandfathered numeric stable id still resolves via its projection", async () => {
+		// Pre-guard legacy rows can hold a numeric stable id. The legacy caller
+		// passes no automationConnectionId, so ingest must use the
+		// agentconn-<id> slug lookup — never mistake the id for a bridged
+		// connections.id and 500 on `WHERE id = N`.
+		await seedAgentRow(AGENT, { organizationId: ORG });
+		const { getDb } = await import("../../db/client.js");
+		const { handleWebhookIngest } = await import(
+			"../connections/webhook-ingest.js"
+		);
+		const stableId = "999983";
+		const sql = getDb();
+		const [projected] = (await sql`
+			INSERT INTO connections (organization_id, connector_key, slug, status, config)
+			VALUES (${ORG}, 'webhook', ${`agentconn-${stableId}`},
+				'active', ${sql.json({})})
+			RETURNING id
+		`) as Array<{ id: number }>;
+		const automationId = await seedWebhookEventAutomation({
+			connectionId: Number(projected.id),
+		});
+		const row = storedRow({ id: stableId }, { semanticType: "alert" });
+		const res = await handleWebhookIngest(
+			row as never,
+			delivery({ severity: "critical" }, { headers: bearer }),
+			fakeSecretStore as never,
+			null,
+			{ activateGenericAutomationEvent: true }
+		);
+		expect(res.status).toBe(202);
+		const landed = (await res.json()) as { ok: boolean; id: number };
+		expect(landed.ok).toBe(true);
+		const [runCount] = await sql<{ count: number }>`
+			SELECT count(*)::int AS count FROM runs
+			WHERE automation_id = ${automationId}
+			  AND run_type = 'automation'
+		`;
+		expect(runCount.count).toBeGreaterThan(0);
+		const rows = await eventRows(stableId);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].connection_id).toBe(Number(projected.id));
+	});
+
 	test("an authenticated Jira delivery lands as a structured event on the Atlassian Rovo feed", async () => {
 		await seedAgentRow(AGENT, { organizationId: ORG });
 		const { manager } = await buildManager();

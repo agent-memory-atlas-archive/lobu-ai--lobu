@@ -1,8 +1,10 @@
+import { select } from "@inquirer/prompts";
 import chalk from "chalk";
 import postgres from "postgres";
-import { select } from "@inquirer/prompts";
-import { getToken, resolveContext } from "../internal/index.js";
 import { resolveApiClient } from "../internal/api-client.js";
+import { readProjectEnvValue } from "../internal/env-file.js";
+import { getToken, resolveContext } from "../internal/index.js";
+import { isExternalDatabaseUrl } from "./dev.js";
 
 interface TokenCreateOptions {
   context?: string;
@@ -135,11 +137,34 @@ export async function tokenRevokeCommand(
     return;
   }
 
-  const databaseUrl = process.env.DATABASE_URL?.trim();
+  // Fall back to the project `.env` like `doctor` does — every other
+  // command reads it, so requiring an exported env var here strands local
+  // installs. Embedded path-form URLs (`file://.`) carry no host to dial
+  // (postgres() parses "." as a hostname → ENOTFOUND), so refuse those
+  // clearly instead of letting the dial fail cryptically.
+  let databaseUrl = process.env.DATABASE_URL?.trim();
+  if (!databaseUrl) {
+    databaseUrl =
+      (await readProjectEnvValue(process.cwd(), "DATABASE_URL")) || undefined;
+  }
   if (!databaseUrl) {
     console.error(
       chalk.red(
         "\n  DATABASE_URL is not set. Run this from the same environment as the gateway.\n"
+      )
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (!isExternalDatabaseUrl(databaseUrl)) {
+    console.error(
+      chalk.red(
+        "\n  DATABASE_URL is a local embedded path, not a connection string, so there is nothing to dial.\n"
+      )
+    );
+    console.log(
+      chalk.dim(
+        "  Point DATABASE_URL at the Postgres the gateway uses (postgresql://…) and retry.\n"
       )
     );
     process.exitCode = 1;
