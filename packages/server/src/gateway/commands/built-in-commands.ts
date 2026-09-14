@@ -8,6 +8,7 @@ import {
   previewAgentMenu,
 } from "../../preview/slack.js";
 import { resolveChatUserIdentity } from "../../lobu/stores/chat-identity.js";
+import { chatUserIdentityFor } from "../../lobu/stores/chat-identity-sources.js";
 import type { AutomationSubscriptionService } from "../channels/automation-subscription-service.js";
 import type { AgentSettingsStore } from "../auth/settings/agent-settings-store.js";
 import {
@@ -179,13 +180,14 @@ export function registerBuiltInCommands(
     handler: async (ctx: CommandContext) => {
       const arg = ctx.args.trim();
       const cmd = formatChatCommand(ctx.platform, "link");
-      // The codeless `<agentId>` shortcut needs a workspace-scoped Slack
-      // identity, which only Slack sign-in and the install claim write — so it
-      // never applies on other platforms. Don't promise it there.
-      const agentIdHint =
-        ctx.platform === "slack"
-          ? " (If you connected this workspace to Lobu, `/lobu link <agentId>` works too.)"
-          : "";
+      // The codeless `<agentId>` shortcut needs a proven chat identity, which a
+      // sign-in with the platform's own provider mints (Slack sign-in or the
+      // Slack install claim; Google sign-in for Google Chat). Offer it wherever
+      // that is possible, in provider-neutral wording — naming the platform here
+      // is what previously kept it invisible to everyone but Slack.
+      const agentIdHint = chatUserIdentityFor(ctx.platform)
+        ? ` (Signed in to Lobu? \`${cmd} <agentId>\` links this chat to your own agent — no code needed.)`
+        : "";
       if (!arg) {
         await ctx.reply(
 					`Usage: \`${cmd} <code>\` — get a code by running \`lobu run\` on a Preview-enabled agent.${agentIdHint}`,
@@ -230,9 +232,10 @@ export function registerBuiltInCommands(
         case "not_found": {
           // Not a valid code — but if we already know who this chat user is,
           // treat the arg as an agent id and re-bind directly (no fresh code
-          // needed). Identity comes only from Slack sign-in / the install claim
-          // (slack-claim.ts), never from redeeming a code: the same mapping
-          // authorizes Slack approvals, so a pasted code must not mint it.
+          // needed). Identity comes only from a chat sign-in (Slack, Google) or
+          // the install claim (slack-claim.ts), never from redeeming a code:
+          // the same mapping authorizes Slack approvals, so a pasted code must
+          // not mint it.
           const lobuUserId = await resolveChatUserIdentity(
             ctx.platform,
             ctx.teamId,
