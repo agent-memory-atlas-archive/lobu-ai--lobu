@@ -426,7 +426,7 @@ export async function reapStaleRuns(): Promise<ReapStaleRunsResult> {
           WHERE r.id = c.id
           RETURNING r.id, r.run_type, r.feed_id, r.connection_id, r.connector_key,
                     r.connector_version, r.organization_id, r.dry_run, r.created_at,
-                    c.stale_status
+                    r.action_key, c.stale_status
         ),
         retries AS (
           INSERT INTO public.runs (
@@ -543,12 +543,31 @@ export async function reapStaleRuns(): Promise<ReapStaleRunsResult> {
              '[]'::json
            )
            FROM dispatch_failures
-          ) AS dispatch_failures
+          ) AS dispatch_failures,
+          -- Auto operation runs carry a dispatch card in the operation ledger
+          -- (operations/operation-run-card.ts). Terminalizing the run here
+          -- without superseding that card would leave it reading "dispatched"
+          -- forever, so the ledger would disagree with the run it describes.
+          -- Approval-gated action runs are excluded from this sweep entirely
+          -- (see the stale_candidates predicate), so every action row reaped
+          -- here is an auto one.
+          (SELECT coalesce(
+             json_agg(json_build_object(
+               'runId', id,
+               'organizationId', organization_id,
+               'actionKey', action_key,
+               'staleStatus', stale_status
+             )),
+             '[]'::json
+           )
+           FROM timed_out WHERE run_type = 'action'
+          ) AS timed_out_actions
       `) as unknown as Array<{
         reaped: number;
         retries_created: number;
         sync_eligible: number;
         dispatch_failures: unknown;
+        timed_out_actions: unknown;
       }>;
 
       // Device-placed chat turns are claimed by the device's own poller, so the
@@ -593,6 +612,51 @@ export async function reapStaleRuns(): Promise<ReapStaleRunsResult> {
 
       if (reapedCount === 0) {
         return { acquired: true, reaped: 0, retriesCreated: 0, dispatchFailures: [] };
+      }
+
+      // Close out the operation ledger for every auto run this sweep reaped.
+      // Best-effort per row and deliberately outside the reap statement: the
+      // UPDATE has already committed, and a card write that throws must not
+      // resurrect a run that is durably terminal. `supersedeActionEvent`
+      // answers undefined for a run with no card — a run created by a pod that
+      // predates the dispatch card — which is not an error here.
+      const timedOutActionsRaw = reapedRow?.timed_out_actions;
+      const timedOutActions = Array.isArray(timedOutActionsRaw)
+        ? timedOutActionsRaw
+        : typeof timedOutActionsRaw === 'string'
+          ? JSON.parse(timedOutActionsRaw)
+          : [];
+      for (const row of timedOutActions as Array<{
+        runId: number;
+        organizationId: string;
+        actionKey: string | null;
+        staleStatus: string | null;
+      }>) {
+        const actionKey = row.actionKey ?? 'Operation';
+        // Mirror the CASE that set `runs.error_message` above: a row reaped at
+        // 'pending' was never claimed by a worker, so its cause is the claim
+        // timeout, not a lost heartbeat. Hardcoding one of the two here made
+        // the ledger card contradict the run it describes.
+        const reason =
+          row.staleStatus === 'pending' ? claimErrorMessage : heartbeatErrorMessage;
+        try {
+          await supersedeActionEvent(
+            row.runId,
+            row.organizationId,
+            'failed',
+            `${actionKey} — timed out`,
+            `Operation timed out: ${actionKey} — ${reason}`,
+            {
+              error_message: reason,
+              run_status: 'timeout',
+            }
+          );
+        } catch (err) {
+          logger.error(
+            { err, runId: row.runId },
+            '[reaper] Failed to supersede the operation card for a reaped auto run'
+          );
+        }
       }
 
       const dispatchFailuresRaw = reapedRow?.dispatch_failures;
