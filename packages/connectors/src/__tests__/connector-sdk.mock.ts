@@ -11,10 +11,14 @@
 // test actually reaches them; extensionDomScrape and the paginateBy* generators
 // are faithfully re-implemented so connectors that delegate their sync loops
 // exercise the real paging semantics (the real helpers have their own tests in
-// packages/connector-sdk). They are re-implemented inline rather than imported
-// from connector-sdk/src because this mock is copied verbatim into the cli's
-// dist/ for the packaged-connector test run, where that cross-package source
-// path does not resolve.
+// packages/connector-sdk). Those stay inline for historical reasons only —
+// neither build copier runs this file.
+
+// The file OUTPUT helpers are imported rather than re-implemented: a hand-copy
+// that drifted would let a connector pass its tests while manufacturing a
+// U+FFFD in prod. `file-output.ts` imports nothing, so it drags in none of the
+// browser stack.
+import * as fileOutput from '../../../connector-sdk/src/file-output.js';
 
 interface DomScrapeOpts {
   dispatcher: {
@@ -142,9 +146,8 @@ export function connectorSdkMock() {
   });
 
   return {
-    // Sole platform entity-type slug for ACL-gated resources. Inlined (not
-    // imported from connector-sdk/src) to keep this mock valid when copied
-    // verbatim into the cli's dist/ (see the file header). Must stay in step
+    ...fileOutput,
+    // Sole platform entity-type slug for ACL-gated resources. Must stay in step
     // with ACL_RESOURCE_TYPE_SLUG in packages/connector-sdk/src/acl-source.ts.
     ACL_RESOURCE_TYPE_SLUG: '$resource',
     HttpStatusError,
