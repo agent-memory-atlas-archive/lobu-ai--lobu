@@ -380,7 +380,7 @@ export function isEarlyDispatchableChatCommand(text: string): boolean {
   if (!firstToken?.startsWith("/")) return false;
   const first = firstToken.replace(/^\/+/, "");
   const command = first === "lobu" ? tokens[1] : first;
-  return ["help", "status", "try", "agents", "link"].includes(command ?? "");
+  return ["help", "status", "link"].includes(command ?? "");
 }
 
 type MessageSource = "mention" | "dm" | "subscribed" | "interaction";
@@ -1058,7 +1058,7 @@ export class MessageHandlerBridge {
     // bare `<slug>-<CODE>` paste — and redeems via the same `link` command. Gated
     // to previewMode so a normal agent bot's DMs (where a code-looking message is
     // just chat for the agent) are never swallowed. Runs before the worker
-    // enqueue and the previewMode menu so a pasted code binds.
+    // enqueue and the previewMode unlinked notice so a pasted code binds.
     if (
       !sessionReset &&
       this.commandDispatcher &&
@@ -1108,18 +1108,18 @@ export class MessageHandlerBridge {
     // Chat): an unlinked DM/@-mention that ISN'T a command. Don't run the
     // connection's placeholder owning agent — that agent carries its
     // organization's model credentials and tool access, and a hosted bot takes
-    // DMs from people who belong to no organization here. Reply with the "pick a
-    // demo agent" menu (or the "wire your own agent" instructions) and stop,
-    // unconditionally: `previewUnlinkedNotice` never declines, so there is no
-    // fall-through. This MUST come after the slash dispatch above: `/lobu link
-    // <code>` / `/lobu try <id>` arrive as slash commands in channels, but as
-    // plain message text in an "Agents & AI Apps" DM — they have to bind/pick
-    // via the dispatcher before we'd otherwise preempt them with this menu.
+    // DMs from people who belong to no organization here. Reply with the linking
+    // instructions and stop, unconditionally: `previewUnlinkedNotice` never
+    // declines, so there is no fall-through. This MUST come after the slash
+    // dispatch above: `/lobu link <code>` arrives as a slash command in
+    // channels, but as plain message text in an "Agents & AI Apps" DM — it has
+    // to bind via the dispatcher before we'd otherwise preempt it with this
+    // notice.
     if (
       resolved.source === "connection" &&
       this.connection.settings?.previewMode === true
     ) {
-      const notice = await previewUnlinkedNotice(platform, this.connection.id);
+      const notice = previewUnlinkedNotice(platform);
       logger.info(
         { platform, channelId, teamId, connectionId: this.connection.id },
         "Preview connection: unlinked chat — replying with the link notice"
