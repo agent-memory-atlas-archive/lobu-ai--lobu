@@ -19,7 +19,11 @@ import {
   buildSearchDocumentExpr,
   buildTsqueryString,
 } from './fts';
-import { buildFinalSelect, deduplicateWithClassifications } from './sql-fragments';
+import {
+  INTERNAL_OPS_EXCLUSION_SQL,
+  buildFinalSelect,
+  deduplicateWithClassifications,
+} from './sql-fragments';
 import { buildSemanticTypeFilterSql } from './params';
 import {
   buildDateCandidateOrderBy,
@@ -205,6 +209,14 @@ export async function searchContentBySingleQuery(
           ${analyzedClause.sql}
           ${visibilityClause.sql}
           ${options.exclude_workspace_audit ? `AND NOT (f.metadata ? '_lobu_workspace_audit')` : ''}
+          ${
+            // Recall-only internal-ops filter (see the option's doc). An
+            // explicit semantic_type filter ($9) wins over it: a caller asking
+            // for 'audit' rows is reading the ops trail on purpose.
+            options.exclude_internal_ops && !options.semantic_type
+              ? `AND ${INTERNAL_OPS_EXCLUSION_SQL}`
+              : ''
+          }
           ${orgScope.sql}${entityTypesClause.sql}`;
 
   const textDocumentExpr = buildSearchDocumentExpr('f');

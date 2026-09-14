@@ -588,7 +588,7 @@ function buildEmptySearchSuggestion(
   // The literals come from the shared constant so the SQL and the filter we
   // hand the agent cannot drift from the value audit events are written with.
   lines.push(
-    `2. **Check activity and audit records:** tool invocations and other operational events are written to \`events\` with no body text and no embedding, so semantic recall cannot rank them and only their titles are searchable. Read them explicitly with \`query_sql\` (e.g. \`SELECT id, title, semantic_type, occurred_at FROM events WHERE semantic_type = '${AUDIT_SEMANTIC_TYPE}' ORDER BY occurred_at DESC LIMIT 50\`) or with \`client.knowledge.read({ semantic_type: '${AUDIT_SEMANTIC_TYPE}' })\` through \`query_sdk\`.`
+    `2. **Check activity and audit records:** tool invocations and other operational events are written to \`events\` with no body text and no embedding, so semantic recall cannot rank them and this tool leaves them out. Read them explicitly with \`query_sql\` (e.g. \`SELECT id, title, semantic_type, occurred_at FROM events WHERE semantic_type = '${AUDIT_SEMANTIC_TYPE}' ORDER BY occurred_at DESC LIMIT 50\`) or with \`client.knowledge.read({ semantic_type: '${AUDIT_SEMANTIC_TYPE}' })\` through \`query_sdk\`.`
   );
 
   const filterRelaxations: string[] = [];
@@ -865,6 +865,11 @@ async function fetchContentSnippets(
         strict_organization_scope: true,
       }),
       ...(excludeWorkspaceAudit && { exclude_workspace_audit: true }),
+      // Recall is a memory surface, not an ops console: internal tool-invocation
+      // audit rows and config/lifecycle state-change rows only title-match into
+      // noise here (duplicate Automation titles, "query_sql completed" for an
+      // unrelated query). Explicit reads via get_content / query_sql unaffected.
+      exclude_internal_ops: true,
       // Enforce the org/private-connection visibility boundary on the recall
       // path, exactly as get_content does. Without visibility_scope the
       // connection-visibility clause is skipped entirely, so search_memory
