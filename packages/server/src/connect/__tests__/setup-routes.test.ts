@@ -46,16 +46,28 @@ describe('managed setup browser handoff', () => {
     expect(await res.text()).toContain('Continue to account authorization');
     expect(f.calls()).toBe(0);
   });
-  test('signed-out visitor gets a login continuation preserving the chosen offer', async () => {
+  test('signed-out visitor redirects to login preserving the chosen offer', async () => {
     const f = fixture({ session: async () => null });
-    const body = await (await f.app.request(url)).text();
-    expect(body).toContain('callbackUrl=');
-    expect(body).toContain('Sign in to continue');
+    const res = await f.app.request(url);
+    expect(res.status).toBe(302);
+    const location = res.headers.get('location') ?? '';
+    expect(location.startsWith('/auth/login?callbackUrl=')).toBe(true);
+    // The redirect is session-dependent, so it must not be cached.
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    // The offer must survive the round trip, or the visitor returns to a blank handoff.
+    expect(decodeURIComponent(location)).toContain(
+      'https://cloud.example/connect/managed?org=public-provider&connector=mail'
+    );
     expect(f.calls()).toBe(0);
   });
   test('stale offer cannot start authorization', async () => {
     const f = fixture({ resolveOffer: async () => null });
-    expect((await f.app.request(url)).status).toBe(404);
+    const res = await f.app.request(url);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain('Connection option unavailable');
+    // Offer availability is mutable per-org state; a cached 404 outlives the
+    // org republishing the offer.
+    expect(res.headers.get('cache-control')).toBe('no-store');
     expect(f.calls()).toBe(0);
   });
   test('rejects cross-origin, missing-origin, and bearer-only submissions', async () => {
@@ -81,10 +93,36 @@ describe('managed setup browser handoff', () => {
     expect(res.status).toBe(403);
     expect(f.calls()).toBe(0);
   });
-  test('rechecks session on POST before creating or reusing a grant', async () => {
+  test('rechecks session on POST and sends an expired one back through login', async () => {
     const f = fixture({ session: async () => null });
-    expect((await f.app.request(url, { method: 'POST', headers })).status).toBe(401);
+    const res = await f.app.request(url, { method: 'POST', headers });
+    // A form POST is a browser navigation; JSON would strand the person on a
+    // consent page whose session expired while it sat open. 303 so the method
+    // change to GET is specified rather than left to browser convention.
+    expect(res.status).toBe(303);
+    expect(decodeURIComponent(res.headers.get('location') ?? '')).toContain(
+      'https://cloud.example/connect/managed?org=public-provider&connector=mail'
+    );
     expect(f.calls()).toBe(0);
+  });
+  test('a visitor with no personal workspace gets an actionable page, not JSON', async () => {
+    const f = fixture({ home: async () => null });
+    const res = await f.app.request(url, { method: 'POST', headers });
+    expect(res.status).toBe(409);
+    const body = await res.text();
+    expect(body).toContain('Finish setting up your account');
+    expect(body).toContain('Return to Lobu');
+    expect(f.calls()).toBe(0);
+  });
+  test('every human-facing dead end offers a way back into the product', async () => {
+    const stale = fixture({ resolveOffer: async () => null });
+    const failed = fixture({ connect: async () => ({ error: 'Offer withdrawn.' }) });
+    for (const res of [
+      await stale.app.request(url),
+      await failed.app.request(url, { method: 'POST', headers }),
+    ]) {
+      expect(await res.text()).toContain('href="/"');
+    }
   });
   test('explicit human submission uses their home workspace and returns local setup instructions', async () => {
     const f = fixture();
@@ -121,7 +159,17 @@ describe('managed setup browser handoff', () => {
     });
     const res = await f.app.request(url, { method: 'POST', headers });
     expect(res.status).toBe(409);
-    expect(await res.text()).toContain('Connect the required device first.');
+    const body = await res.text();
+    expect(body).toContain('Connect the required device first.');
+    expect(body).toContain('Connection setup needs attention');
+  });
+  test('a failed grant reuses the shared OAuth error page', async () => {
+    const f = fixture({ connect: async () => ({ error: 'Managed OAuth is no longer available.' }) });
+    const res = await f.app.request(url, { method: 'POST', headers });
+    expect(res.status).toBe(400);
+    const body = await res.text();
+    expect(body).toContain('Managed OAuth is no longer available.');
+    expect(body).toContain('Technical details');
   });
   test('public metadata does not require a browser session', async () => {
     const f = fixture({
