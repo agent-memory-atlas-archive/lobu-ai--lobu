@@ -20,7 +20,11 @@
  * specific and why they are worth keeping verbatim rather than generalising.
  */
 
-import { AgentErrorCode, PROVIDER_BALANCE_EXHAUSTED } from "./errors.js";
+import {
+  AgentErrorCode,
+  PROVIDER_BALANCE_EXHAUSTED,
+  PROVIDER_WINDOWED_QUOTA,
+} from "./errors.js";
 import { getProviderAuthHintFromError } from "./provider-auth-hints.js";
 
 /**
@@ -54,6 +58,20 @@ export function classifyErrorMessage(
   if (/wall-clock budget of \d+ms exceeded/.test(message))
     return AgentErrorCode.WORKER_UNRESPONSIVE;
 
+  // The isolate EXECUTOR's timeout, which is a different path from the host
+  // wall-clock kill above and was never classified: `IsolateExecutor` throws
+  // "Execution timed out after <n>ms" when `host.run` exceeds its budget. Same
+  // event class, same remediation, so it takes the same code — without it the
+  // user read a raw "…timed out after 600000ms" with no CTA (11 agent turns in
+  // the 30 days to 2026-09-15, all of them wedged for the full 600s).
+  //
+  // The leading `(?:Feed )?` is not optional politeness: that message said
+  // "Feed execution timed out" until this change, workers deploy on their own
+  // cadence, and the server classifies whatever text the worker sent. Matching
+  // both spellings keeps a mid-rollout worker's failures classified.
+  if (/(?:feed )?execution timed out after \d+ms/i.test(message))
+    return AgentErrorCode.WORKER_UNRESPONSIVE;
+
   // Provider usage/rate limit. Covers "429 Weekly/Monthly Limit
   // Exhausted", generic rate-limit/quota phrasings, and a bare 429. Placed
   // before PROVIDER_AUTH because a rate-limited request can also echo auth-ish
@@ -67,11 +85,21 @@ export function classifyErrorMessage(
   if (PROVIDER_BALANCE_EXHAUSTED.test(message))
     return AgentErrorCode.PROVIDER_QUOTA_EXHAUSTED;
 
-  if (
-    /weekly\/monthly limit exhausted|limit exhausted|rate[-\s]?limit|quota (?:exceeded|exhausted)|too many requests|\b429\b|resource_exhausted/i.test(
-      message
-    )
-  )
+  // `usage limit` is ChatGPT subscription wording ("You have hit your ChatGPT
+  // usage limit (pro plan)."). It was the single largest unclassified failure
+  // in prod over the 30 days to 2026-09-15 — 47 of the 52 runs the provider
+  // had refused and the platform blamed on the agent, across both agent turns
+  // and Automation runs — and being unclassified cost three things at once: the
+  // run was blamed on the agent (`outcome = agent_error`), the user got the
+  // raw provider sentence with no "Manage provider" CTA, and the failure
+  // dodged the PROVIDER_* alert.
+  //
+  // It belongs HERE and not in `PROVIDER_BALANCE_EXHAUSTED` above: a
+  // subscription usage limit is WINDOWED — the provider names its own reset,
+  // hours or days out — while that union parks an Automation for a flat day
+  // regardless. Parking a windowed limit on a balance schedule would be a
+  // worse bug than the one this fixes.
+  if (PROVIDER_WINDOWED_QUOTA.test(message))
     return AgentErrorCode.PROVIDER_QUOTA_EXHAUSTED;
 
   // Gemini can end a turn with this provider-side tool-call rejection instead
@@ -131,8 +159,29 @@ export function classifyErrorMessage(
   // reaches here from an upstream provider, so its length is not ours to
   // trust. Lazy stops at the first " not found" and the bound caps the walk;
   // spaces stay allowed so a quoted multi-word id still classifies.
+  //
+  // `access to model denied` / `eligible for using the model` is the provider
+  // refusing THIS account this model ("403 Access to model denied. Please make
+  // sure you are eligible for using the model.", seen in prod on agent turns).
+  // The credential is good and every other model still works, so this is the
+  // model class and not PROVIDER_AUTH: "Choose model" is the remediation that
+  // actually unblocks the user, where "Reconnect provider" would send them to
+  // re-auth a credential that is already valid.
+  //
+  // The model exists but cannot serve THIS request: OpenAI answers
+  // "404 This model is only supported in v1/responses and not in
+  // v1/chat/completions.", OpenRouter "404 No endpoints found that support tool
+  // use." Both are a model/capability mismatch the user fixes by picking a
+  // different model, so they take the model code and its "Choose model" CTA
+  // rather than reading as an agent crash.
+  //
+  // Unlike the other entries here these were reproduced locally (a live turn
+  // against `openai/o1-pro` and `openrouter/openai/o1-pro` on 2026-09-15), not
+  // observed in prod — the 90-day corpus has no agent-turn 404 of either shape.
+  // Replaying that corpus with these patterns moves nothing, which is the
+  // evidence they do not over-match real traffic.
   if (
-    /not a valid model|unknown model|model [^\n]{0,120}? not found/i.test(
+    /not a valid model|unknown model|model [^\n]{0,120}? not found|access to model denied|eligible for using the model|model is only supported in|no endpoints found that support/i.test(
       message
     )
   )
