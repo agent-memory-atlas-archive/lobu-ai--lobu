@@ -30,7 +30,6 @@ import {
   resolveAgentId,
   resolveAgentOptions,
 } from "../services/platform-helpers.js";
-import { resolveSlackBotIdentity } from "../../authz/slack-acl-sync.js";
 import {
   buildAutomationTurnContext,
   type AutomationActivationPlan,
@@ -52,10 +51,10 @@ import { buildCtaCardPayload } from "../platform/link-buttons.js";
 import { stripPlatformPrefix } from "../channels/bound-channels.js";
 import { buildConversationUrl } from "./conversation-url.js";
 import { captureChannelMessage } from "./channel-transcript.js";
-import { createSlackWebApi } from "./slack-web.js";
 import type { ConversationStateStore } from "./conversation-state-store.js";
 import type { ChatInstanceManager } from "./chat-instance-manager.js";
 import type { PlatformConnection } from "./types.js";
+import { getPlatformDescriptor } from "./platforms/index.js";
 
 const logger = createLogger("chat-message-bridge");
 
@@ -429,16 +428,19 @@ export function registerMessageHandlers(
     await handler.handleMessage(thread, message, "subscribed");
   });
 
-  // Chat SDK subscriptions are thread-scoped. Slack gives every top-level
-  // channel message a fresh thread id (`slack:C…:<message-ts>`), so an
-  // Automation linked to the CHANNEL can never pre-subscribe the ids of future
-  // messages. Those ordinary `message.channels` events therefore fall through
-  // the SDK's mention/DM/subscribed branches into its pattern handlers. The
-  // SDK routes subscribed → mention → patterns and returns at the first match,
-  // so this catch-all only ever sees events the branches above declined; it
-  // cannot double-dispatch a mention. Admit only channels that already have a
-  // durable message Automation — unlinked channels stay silent.
-  if (connection.platform === "slack") {
+  // Chat SDK subscriptions are thread-scoped. On a platform that mints a FRESH
+  // thread id per top-level channel message, an Automation linked to the
+  // CHANNEL can never pre-subscribe the ids of future messages, so those
+  // events fall through the SDK's mention/DM/subscribed branches into its
+  // pattern handlers. The SDK routes subscribed → mention → patterns and
+  // returns at the first match, so this catch-all only ever sees events the
+  // branches above declined; it cannot double-dispatch a mention. Admit only
+  // channels that already have a durable message Automation — unlinked
+  // channels stay silent.
+  if (
+    getPlatformDescriptor(connection.platform)
+      ?.channelMessagesMintFreshThreadIds
+  ) {
     chat.onNewMessage(/[\s\S]*/, async (thread: any, message: any) => {
       await handler.handleUnmatchedChannelMessage(thread, message);
     });
@@ -554,11 +556,10 @@ export class MessageHandlerBridge {
    * no channel Automation and the connection has no owning agent — with a
    * "link this chat" notice instead of dropping silently.
    *
-   * Every platform gets the deep-linked notice. Only two things here remain
-   * Slack-specific, and both are enrichment: the `metadata.teamId` gate on a
-   * tenant's OAuth-installed workspace bot, and the `conversations.info`
-   * lookup that turns a channel id into a friendly `#name` for the link label
-   * (#2230). Loop safety needs no extra
+   * Every platform gets the deep-linked notice unless its own descriptor
+   * suppresses it; whatever the deep link can additionally name (a workspace,
+   * a friendly channel name) comes from `resolveNoticeChannelScope` rather
+   * than from a slug branch here (#2230). Loop safety needs no extra
    * state: the Chat SDK never re-delivers the bot's own posts (`isMe`), and a
    * channel with an Automation subscription never reaches this dead end (the
    * planner-rejection guard in `handleMessage` drops it silently first).
@@ -583,53 +584,22 @@ export class MessageHandlerBridge {
       connectionSlug?: string;
     } = { channelId, connectionSlug: runtimeConnectionIdToSlug(this.connection.id) };
 
-    if (platform === "slack") {
-      // A tenant's OAuth-installed Slack workspace bot has no owning agent —
-      // routing is via tagged Automations created by `/lobu link`. Before the
-      // tenant links a channel, a non-command message resolves to nothing.
-      // (Slash commands like `/lobu link` take the `onSlashCommand` path and
-      // never reach here.)
-      if (!this.connection.metadata?.teamId) return false;
-      // Fall back to the connection's stored team when the raw event omits
-      // team_id, so the deep-link stays team-scoped. The connection always
-      // carries it — it's the gate above.
-      const linkTeamId = teamId ?? this.connection.metadata?.teamId;
-      // Best-effort: resolve the channel's friendly name (#general) for the
-      // notice's deep-link label. Uses this connection's own bot token via
-      // conversations.info; any failure (no token, not-in-channel, rate limit)
-      // just drops to the channel id in the UI — never blocks the notice.
-      let channelName: string | undefined;
-      if (linkTeamId) {
-        try {
-          const slackWeb = createSlackWebApi();
-          const identity = await resolveSlackBotIdentity(
-            {
-              installStore: this.services.getAppInstallationStore(),
-              secretStore: this.services.getSecretStore(),
-              slackWeb,
-            },
-            {
-              organizationId: this.connection.organizationId,
-              teamId: linkTeamId,
-              connectionId: this.connection.id,
-            }
-          );
-          if (identity?.token) {
-            const info = await slackWeb.conversationInfo(
-              identity.token,
-              stripPlatformPrefix(platform, channelId)
-            );
-            channelName = info.name ?? undefined;
-          }
-        } catch (err) {
-          logger.debug(
-            { channelId, error: String(err) },
-            "unlinked-notice: channel name lookup failed (using id)"
-          );
-        }
-      }
-      noticeChannel = { ...noticeChannel, teamId: linkTeamId, channelName };
-    }
+    // The platform decides whether an unlinked chat earns a notice at all and
+    // what its deep link can name — a workspace-scoped install with no known
+    // workspace suppresses it rather than linking to nothing.
+    const scope = await getPlatformDescriptor(
+      platform,
+    )?.resolveNoticeChannelScope?.(this.connection, {
+      organizationId: this.connection.organizationId,
+      channelId,
+      teamId,
+      stores: {
+        getAppInstallationStore: () => this.services.getAppInstallationStore(),
+        getSecretStore: () => this.services.getSecretStore(),
+      },
+    });
+    if (scope === null) return false;
+    if (scope) noticeChannel = { ...noticeChannel, ...scope };
 
     const notice = await workspaceUnlinkedNotice(
       platform,
@@ -870,16 +840,16 @@ export class MessageHandlerBridge {
       ]),
     ];
 
-    // Lazy self-heal (Slack Grid): an Automation written before its workspace was
-    // known carries no team. Inbound Slack events reliably carry the REAL
-    // workspace `T…` (never the enterprise `E…`), so converge the trigger's team
-    // to it on the first message. Guarded to fill only an unknown team; best-
+    // Lazy self-heal: an Automation written before its workspace was known
+    // carries no team, so converge the trigger's team to the one the inbound
+    // event carried on the first message. The platform decides which team ids
+    // are real workspaces (`bindableTeamId`) — a platform with no workspace
+    // axis has nothing to heal. Guarded to fill only an unknown team; best-
     // effort — a heal failure must never block routing.
     if (
       resolved.source === "automation" &&
       automationSubscriptionService &&
-      platform === "slack" &&
-      /^T[A-Z0-9]+$/i.test(teamId ?? "") &&
+      getPlatformDescriptor(platform)?.bindableTeamId?.(teamId ?? "") === true &&
       routingOrganizationIds.length > 0
     ) {
       for (const organizationId of routingOrganizationIds) {
@@ -907,9 +877,10 @@ export class MessageHandlerBridge {
     // can never overwrite an explicit `/lobu link` that races it (decided under
     // the advisory lock inside createChatAutomation — race-safe across replicas).
     // Group channels only (DMs stay out of the bound set); hosted-preview
-    // placeholder agents are excluded. Slack passes only a real workspace `T…`
-    // (never enterprise `E…`); an unknown team is filled later by
-    // healSubscriptionTeam. Best-effort — a failure must never block the turn.
+    // placeholder agents are excluded. The team is scoped by the same
+    // `bindableTeamId` rule the self-heal above uses, so a platform never gets
+    // a non-workspace id written onto the link; an unknown team is filled later
+    // by healSubscriptionTeam. Best-effort — a failure must never block the turn.
     if (
       resolved.source === "connection" &&
       isGroup &&
@@ -917,10 +888,9 @@ export class MessageHandlerBridge {
       automationSubscriptionService &&
       this.connection.organizationId
     ) {
+      const isBindable = getPlatformDescriptor(platform)?.bindableTeamId;
       const bindingTeamId =
-        platform !== "slack" || /^T[A-Z0-9]+$/i.test(teamId ?? "")
-          ? teamId
-          : undefined;
+        !isBindable || isBindable(teamId ?? "") ? teamId : undefined;
       try {
         await automationSubscriptionService.materializeConnectionFallbackLink(
           this.connection.id,

@@ -6,12 +6,22 @@
  * capability.)
  */
 
+import { createLogger } from "@lobu/core";
 import { stripPlatformPrefix } from "../../channels/bound-channels.js";
 import type { IFileHandler } from "../../platform/file-handler.js";
 import { SlackInstructionProvider } from "../slack-instruction-provider.js";
+import { createSlackWebApi } from "../slack-web.js";
 import { isSlackConfig } from "../types.js";
+import type { PlatformConnection } from "../types.js";
 import { postFileToChatTarget, streamToBuffer } from "./shared.js";
-import type { ChatPlatformDescriptor, ChatPlatformInstance } from "./types.js";
+import type {
+  ChatPlatformDescriptor,
+  ChatPlatformInstance,
+  NoticeChannelContext,
+  NoticeChannelScope,
+} from "./types.js";
+
+const logger = createLogger("slack-platform");
 
 function createSlackFileHandler(
   instance: ChatPlatformInstance
@@ -80,7 +90,70 @@ function createSlackFileHandler(
   };
 }
 
+/**
+ * A tenant's OAuth-installed workspace bot has no owning agent — routing is by
+ * tagged Automations created through `/lobu link`. Until the tenant links a
+ * channel, an ordinary message resolves to nothing and earns the notice. A
+ * connection with no known workspace cannot produce a usable deep link, so it
+ * suppresses the notice instead of posting one that names nothing.
+ */
+async function resolveSlackNoticeChannelScope(
+  connection: PlatformConnection,
+  ctx: NoticeChannelContext
+): Promise<NoticeChannelScope | null> {
+  const storedTeamId = connection.metadata?.teamId;
+  if (!storedTeamId) return null;
+  // The inbound event may omit team_id; the connection always carries one —
+  // that is the gate above — so the deep link stays workspace-scoped either way.
+  const teamId = ctx.teamId ?? storedTeamId;
+
+  // Best-effort `#general` for the link label, via this connection's own bot
+  // token. Any failure (no token, not in channel, rate limit) falls back to the
+  // channel id in the UI and must never block the notice.
+  let channelName: string | undefined;
+  try {
+    // Dynamic by measurement, not taste. Importing `authz/slack-acl-sync.js`
+    // statically here drags this module — and through it the registry — into
+    // the server's import cycles: `madge --circular packages/server/src`
+    // counts 2 cycles containing `platforms/index.ts` on main and 29 with that
+    // one edge added; dropping it returns the count to 2. That matters because
+    // `index.ts` builds PLATFORM_REGISTRY at module-eval time from
+    // `const slackPlatform`, so a registry inside a cycle can be read in its
+    // TDZ on an unlucky entry order and hand back an `undefined` descriptor.
+    // A call-time import cannot join a module-evaluation cycle, which is what
+    // keeps the registry out. (`createAdapter` below defers the adapter SDK
+    // the same way.)
+    const { resolveSlackBotIdentity } = await import(
+      "../../../authz/slack-acl-sync.js"
+    );
+    const slackWeb = createSlackWebApi();
+    const identity = await resolveSlackBotIdentity(
+      {
+        installStore: ctx.stores.getAppInstallationStore(),
+        secretStore: ctx.stores.getSecretStore(),
+        slackWeb,
+      },
+      { organizationId: ctx.organizationId, teamId, connectionId: connection.id }
+    );
+    if (identity?.token) {
+      const info = await slackWeb.conversationInfo(
+        identity.token,
+        stripPlatformPrefix(connection.platform, ctx.channelId)
+      );
+      channelName = info.name ?? undefined;
+    }
+  } catch (err) {
+    logger.debug(
+      { channelId: ctx.channelId, error: String(err) },
+      "unlinked-notice: channel name lookup failed (using id)"
+    );
+  }
+  return { teamId, channelName };
+}
+
 export const slackPlatform: ChatPlatformDescriptor = {
+  requiredConfigKeys: ["botToken", "signingSecret"],
+
   // Pre-existing lazy adapter factory, moved verbatim from the manager's
   // ADAPTER_FACTORIES map (adapter SDKs stay lazy-loaded per platform).
   createAdapter: async (c) =>
@@ -97,6 +170,27 @@ export const slackPlatform: ChatPlatformDescriptor = {
       teamId: slack.team,
     };
   },
+
+  // Chat Automation projections key Slack channels by the canonical
+  // `slack:<id>` the bridge looks bindings up with (`thread.channelId`), but a
+  // slash command hands us the bare `C…`/`D…`. A value that already carries a
+  // transport prefix is left alone.
+  canonicalChannelId: (channelId) =>
+    /^[a-z]+:/i.test(channelId) ? channelId : `slack:${channelId}`,
+
+  // `#` is how a Slack channel is written, and the stored name may or may not
+  // already carry it.
+  formatChannelLabel: (name) => `#${name.replace(/^#/, "")}`,
+
+  // Inbound Slack events carry the REAL workspace `T…`; the enterprise `E…` of
+  // a Grid org is not a workspace and must never be bound to.
+  bindableTeamId: (teamId) => /^T[A-Z0-9]+$/i.test(teamId),
+
+  // Slack gives every top-level channel message a fresh thread id
+  // (`slack:C…:<message-ts>`).
+  channelMessagesMintFreshThreadIds: true,
+
+  resolveNoticeChannelScope: resolveSlackNoticeChannelScope,
 
   createFileHandler: createSlackFileHandler,
 

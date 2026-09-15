@@ -3,15 +3,18 @@
  *
  * Each chat platform contributes one `ChatPlatformDescriptor` to the registry
  * in `./index.ts` (keyed by platform name, merged with the adapter factory
- * that used to live in `ADAPTER_FACTORIES`). `ChatInstanceManager` stays
- * platform-agnostic: it looks up the descriptor for a connection's platform
- * and calls the optional capability hooks, falling back gracefully when a
- * hook is absent. Adding a platform means adding one module under
- * `./platforms/` and registering it in `./index.ts` — no manager edits.
+ * that used to live in `ADAPTER_FACTORIES`). Its consumers — the instance
+ * manager, the message-handler bridge, the connection config service, the
+ * conversations listing — stay platform-agnostic: each looks up the
+ * descriptor for a connection's platform and calls the optional capability
+ * hooks, falling back gracefully when a hook is absent. Adding a platform
+ * means adding one module under `./platforms/` and registering it in
+ * `./index.ts` — no edits to any of those consumers.
  */
 
 import type { InstructionProvider, StoredConnection } from "@lobu/core";
 import type { IFileHandler } from "../../platform/file-handler.js";
+import type { AppInstallationStore } from "../../../lobu/stores/app-installation-store.js";
 import type { WritableSecretStore } from "../../secrets/index.js";
 import type { ChatInstanceManager } from "../chat-instance-manager.js";
 import type { PlatformAdapterConfig, PlatformConnection } from "../types.js";
@@ -53,6 +56,38 @@ export interface WebhookSecretDeps {
 export interface AdapterCreationContext {
   /** Canonical public URL that receives this connection's webhooks. */
   webhookUrl?: string;
+}
+
+/** What a descriptor may add to an unlinked-chat notice's deep link. */
+export interface NoticeChannelScope {
+  /** Workspace the deep link should stay scoped to. */
+  teamId?: string;
+  /** Friendly channel name for the link's label (`#general`). */
+  channelName?: string;
+}
+
+/** Caller-owned context handed to `resolveNoticeChannelScope`. */
+export interface NoticeChannelContext {
+  organizationId: string;
+  /** Channel id as the bridge holds it, still transport-prefixed. */
+  channelId: string;
+  /** Workspace id carried by the inbound event, when it carried one. */
+  teamId?: string;
+  /**
+   * Gateway-owned stores, handed in rather than imported, so a descriptor can
+   * reach its own provider API without reaching into the gateway's internals.
+   *
+   * Getters, not resolved values, and the laziness is load-bearing: a
+   * descriptor that declines early — Slack returns null the moment a
+   * connection has no known workspace — must not have caused the gateway to
+   * construct an installation or secret store for a notice it never sends.
+   * Flattening these to resolved values reaches into `services` on EVERY
+   * unlinked message and fails any caller that does not provide them.
+   */
+  stores: {
+    getAppInstallationStore(): AppInstallationStore;
+    getSecretStore(): WritableSecretStore;
+  };
 }
 
 /**
@@ -138,6 +173,74 @@ export interface ChatPlatformDescriptor {
     connection: PlatformConnection,
     webhookUrl: string
   ): Promise<void>;
+
+  /**
+   * The platform's canonical form of a channel id — the spelling bindings and
+   * Automation projections are keyed by. A platform whose inbound events and
+   * its own slash commands disagree normalizes here: Slack hands a slash
+   * command the bare `C…`/`D…` while every binding is stored `slack:C…`.
+   * Absent hook = the id the caller already holds is canonical.
+   */
+  canonicalChannelId?(channelId: string): string;
+
+  /**
+   * Render a channel's display name the way a reader of THIS platform expects
+   * it. `#general` on Slack, where `#` is simply how a channel is written;
+   * bare everywhere else, because a Google Chat space or a Telegram group
+   * names itself and a `#` would be noise. Absent hook = use the stored name.
+   */
+  formatChannelLabel?(name: string): string;
+
+  /**
+   * True when `teamId` is a real workspace id this platform may write onto an
+   * Automation subscription — both to converge a teamless one and to scope a
+   * newly materialized link. Slack Grid is the case: inbound events reliably
+   * carry the REAL workspace `T…`, never the enterprise `E…`, which names no
+   * workspace and would scope a binding to nothing. Absent hook = the platform
+   * has no workspace axis, so whatever the event carried is fine.
+   */
+  bindableTeamId?(teamId: string): boolean;
+
+  /**
+   * True when a top-level channel message gets a FRESH thread id, so an
+   * Automation bound to the CHANNEL can never pre-subscribe the ids of future
+   * messages. Those events fall past the Chat SDK's subscribed → mention →
+   * pattern routing into the pattern handlers, so the bridge registers a
+   * catch-all to pick them up. Absent/false = channel messages keep a stable
+   * conversation id and the SDK's own branches already deliver them.
+   */
+  channelMessagesMintFreshThreadIds?: boolean;
+
+  /**
+   * Config keys this platform cannot run without, checked before the row is
+   * persisted. A nested array is an EITHER-OR group ("at least one of these"),
+   * reported as `a or b` — Google Chat takes a service-account JSON key or
+   * Application Default Credentials, never neither. A key counts as supplied
+   * when it holds a non-blank string or boolean `true` (an ADC-style flag).
+   * Format is not checked here, only presence: see `assertCredentialsUsable`.
+   */
+  requiredConfigKeys?: readonly (string | readonly string[])[];
+
+  /**
+   * Throw when a credential that IS present is unusable — malformed
+   * service-account JSON, say. Runs after `requiredConfigKeys`, so the value
+   * is known to exist; a platform whose credentials are opaque strings needs
+   * no hook.
+   */
+  assertCredentialsUsable?(config: Record<string, unknown>): void;
+
+  /**
+   * Decide whether an unlinked chat should get a "link me to an agent" notice,
+   * and enrich the deep link that notice carries. Returning `null` SUPPRESSES
+   * the notice — a Slack workspace install with no known workspace is in a
+   * state where a notice would name nothing useful. Everything in the returned
+   * scope is best-effort decoration; a platform with no hook simply posts the
+   * notice with the channel id it already has.
+   */
+  resolveNoticeChannelScope?(
+    connection: PlatformConnection,
+    ctx: NoticeChannelContext
+  ): Promise<NoticeChannelScope | null>;
 
   /** Register slash commands with the platform's native command menu. */
   registerCommands?(
