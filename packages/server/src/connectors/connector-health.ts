@@ -89,6 +89,7 @@ import { notifyBrowserAuthExpired } from '../notifications/triggers';
 import logger from '../utils/logger';
 import { aclConnectionIdSql, isAclErrorMessage } from '../authz/acl-observability';
 import { deriveFeedHealthSemantics, feedWebhookDrivenSql } from './feed-health-semantics';
+import { connectorHasAutoSyncableFeedsSql } from './connection-health-semantics';
 
 /**
  * Does this feed error look like an expired/invalid site session (the user must
@@ -123,6 +124,30 @@ const MIN_CONNECTION_AGE_HOURS = 24;
  * see scoping in the query.)
  */
 const ZERO_FEEDS_GRACE_HOURS = 48;
+
+/**
+ * A connection none of whose expected feeds has EVER synced successfully, older
+ * than this, is flagged.
+ *
+ * This is the hole the other rules cannot see. Every rule above describes a
+ * REGRESSION and needs a "before" to measure against: `no_recent_sync`
+ * explicitly requires a past success (see {@link NO_SYNC_DAYS}) and
+ * `device_stale` requires a non-NULL pin. A connection that never started has
+ * no before, so it was invisible to all of them and stayed healthy forever.
+ * Measured on prod 2026-09-15 a `whatsapp.web` connection sat `status='active'`
+ * with zero runs and no feed; the same shape hides a run that is created but
+ * never claimed, which is silent by construction.
+ *
+ * This is the exact complement of Rule C's own guard — `newestSyncAtMs === null`
+ * versus its `!== null` — so between them every expected-feed connection is
+ * covered and neither can claim a connection the other does.
+ *
+ * Deliberately NOT keyed on cumulative `feeds.items_collected`, which would also
+ * catch "syncs fine, emits nothing". That reads as a defect but is routine — a
+ * mailbox label with no mail syncs successfully and collects zero forever — and
+ * this path pages a human. Never-succeeded is unambiguous; never-produced is not.
+ */
+const NEVER_COLLECTED_GRACE_HOURS = 48;
 
 /**
  * A connection that was collecting (at least one feed has a past successful
@@ -194,6 +219,7 @@ export interface ConnectorHealthConfig {
   failureThreshold: number;
   minConnectionAgeHours: number;
   zeroFeedsGraceHours: number;
+  neverCollectedGraceHours: number;
   noSyncDays: number;
   degradedFailingRatio: number;
   degradedMinExpectedFeeds: number;
@@ -204,6 +230,7 @@ export const DEFAULT_CONNECTOR_HEALTH_CONFIG: ConnectorHealthConfig = {
   failureThreshold: FAILURE_THRESHOLD,
   minConnectionAgeHours: MIN_CONNECTION_AGE_HOURS,
   zeroFeedsGraceHours: ZERO_FEEDS_GRACE_HOURS,
+  neverCollectedGraceHours: NEVER_COLLECTED_GRACE_HOURS,
   noSyncDays: NO_SYNC_DAYS,
   degradedFailingRatio: DEGRADED_FAILING_RATIO,
   degradedMinExpectedFeeds: DEGRADED_MIN_EXPECTED_FEEDS,
@@ -214,6 +241,7 @@ export type UnhealthyReason =
   | 'all_feeds_failing'
   | 'feeds_degraded'
   | 'zero_feeds'
+  | 'never_collected'
   | 'no_recent_sync'
   | 'acl_failed';
 
@@ -265,6 +293,7 @@ interface FeedHealthRow {
   connection_created_at: Date | string;
   connection_status: string | null;
   credential_mode: string | null;
+  consent_only: boolean;
   /** Whether the selected definition declares a sync operation that Lobu can
    *  create without user-supplied instance config. A zero-feed row necessarily
    *  selects the active definition. NULL means no selectable definition was
@@ -313,6 +342,13 @@ async function loadConnectionHealthRows(
       c.created_at AS connection_created_at,
       c.status AS connection_status,
       c.credential_mode,
+      -- Text comparison, never a ::boolean cast. config is free-form
+      -- tenant-written jsonb, so a value like "maybe" or an object would make
+      -- the cast raise and abort this whole scan -- which is global, so one
+      -- malformed row in one org would silence health alerting for every org.
+      -- Every other reader of this key compares text, including the filter
+      -- further down this same query.
+      COALESCE(c.config ->> 'consent_only' = 'true', false) AS consent_only,
       cd.has_auto_syncable_feeds AS connector_has_auto_syncable_feeds,
       ap.status AS auth_profile_status,
       -- Fails CLOSED on a missing/blank worker row: a connection pinned to a
@@ -377,12 +413,7 @@ async function loadConnectionHealthRows(
         -- Shared with list_feeds; see feedWebhookDrivenSql for why a bare
         -- IS NOT NULL on the webhook key is not equivalent.
         ${sql.unsafe(feedWebhookDrivenSql('definition', 'f'))} AS feed_webhook_driven,
-        EXISTS (
-          SELECT 1
-          FROM jsonb_each(COALESCE(definition.feeds_schema, '{}'::jsonb)) AS declared(feed_key, config)
-          WHERE COALESCE(declared.config -> 'operations', '[]'::jsonb) @> '["sync"]'::jsonb
-            AND COALESCE((declared.config ->> 'userManaged')::boolean, false) = false
-        ) AS has_auto_syncable_feeds
+        ${sql.unsafe(connectorHasAutoSyncableFeedsSql('definition'))} AS has_auto_syncable_feeds
       FROM connector_definitions definition
       WHERE definition.key = c.connector_key
         AND definition.organization_id = c.organization_id
@@ -483,6 +514,23 @@ function classifyFeed(row: FeedHealthRow, cfg: ConnectorHealthConfig): Classifie
 }
 
 /**
+ * Has a connection outlived the grace window for the "never started" rules?
+ *
+ * An unparseable or missing `created_at` reads as elapsed, matching the
+ * fail-closed stance the zero-feed rule already takes: an install problem we
+ * cannot date is still an install problem.
+ */
+function neverCollectedGraceElapsed(
+  connectionCreatedAt: Date | string | undefined,
+  cfg: ConnectorHealthConfig,
+  nowMs: number
+): boolean {
+  const createdAtMs = tsTimeOrNull(connectionCreatedAt);
+  if (createdAtMs === undefined) return true;
+  return nowMs - createdAtMs >= cfg.neverCollectedGraceHours * 60 * 60 * 1000;
+}
+
+/**
  * Per-connection aggregation over the classified feeds. Returns the tripped
  * rule plus the aggregate detail an alert carries, or null if healthy. Order
  * matters: zero-feeds is checked before all-feeds-failing (which is vacuously
@@ -523,6 +571,16 @@ function classify(
     // Chat rows are transports, not collectors. A channel-less chat connection
     // must not trip the collector-only zero-feed rule.
     if (rows[0]?.credential_mode != null) return null;
+    // A consent-only connection holds an OAuth grant for cloud-delegated token
+    // fetch and MUST have no feeds — the member's data stays on their local
+    // instance, and `manage_feeds` refuses feeds on one outright. Zero feeds is
+    // the designed state, not an install problem.
+    //
+    // Measured on prod 2026-09-15: all 8 active consent-only zero-feed
+    // connections carried `unhealthy_alerted_at`, the oldest since 2026-07-09 —
+    // this rule has been paging on connections working exactly as intended, and
+    // no operator action could ever clear them.
+    if (rows[0]?.consent_only === true) return null;
     // Operation-only, source-only, and user-managed-only connectors
     // legitimately have no automatic collector rows. If the definition is
     // missing, keep the alert fail-closed instead of hiding an install problem.
@@ -547,6 +605,17 @@ function classify(
   let failingExpectedCount = 0;
   let persistentCount = 0;
   let newestSyncAtMs: number | null = null;
+  // Has any expected feed ever finished a sync, successfully or not?
+  //
+  // `last_sync_status` cannot answer this: the worker claim CTE stamps
+  // 'pending' on every sync claim (worker-api/poll.ts) and a failure stamps
+  // 'failed', so the column only ever reports the LATEST attempt and a feed
+  // that collected for months reads as though it never had. `last_sync_at` is
+  // written by both terminal paths and by neither the claim nor the enqueue, so
+  // a NULL there is the one durable "this feed has never finished a run"
+  // signal — the same definition `feed-health-semantics.ts` uses for
+  // `never_run`.
+  let everFinishedASync = false;
   let failingError: string | null = null;
   let expectedError: string | null = null;
 
@@ -562,6 +631,7 @@ function classify(
     }
     if (feed.persistent) persistentCount += 1;
 
+    if (row.last_sync_at) everFinishedASync = true;
     if (row.last_sync_status === 'success' && row.last_sync_at) {
       const syncMs = tsTimeOrNull(row.last_sync_at);
       if (syncMs !== undefined && (newestSyncAtMs === null || syncMs > newestSyncAtMs)) {
@@ -600,6 +670,19 @@ function classify(
     // EXPECTED feeds is older than NO_SYNC_DAYS. Scoped to expected feeds so a
     // feed that can never sync cannot keep the timestamp fresh forever.
     reason = 'no_recent_sync';
+  } else if (
+    !everFinishedASync &&
+    neverCollectedGraceElapsed(rows[0]?.connection_created_at, cfg, nowMs)
+  ) {
+    // Rule E: never started — no expected feed has ever FINISHED a sync, so
+    // there is no "before" for any regression rule to measure against and this
+    // connection was invisible to all of them. Deliberately keyed on
+    // everFinishedASync and not on the newest SUCCESS: a connection that
+    // collected for months and is now failing, or simply mid-run when the scan
+    // lands, has no current success either, and calling that "never collected"
+    // is both false and a worse description than the failure rules above
+    // already give it. See NEVER_COLLECTED_GRACE_HOURS for the grace window.
+    reason = 'never_collected';
   } else {
     return null;
   }

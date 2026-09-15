@@ -51,19 +51,29 @@ async function seedConnection(opts: {
   deviceWorkerId?: string | null;
   authProfileId?: number | null;
   credentialMode?: 'managed' | 'byo' | null;
+  consentOnly?: boolean;
+  /** Raw config, for shapes consentOnly cannot express (a non-boolean value). */
+  config?: Record<string, unknown>;
 }): Promise<SeededConn> {
   const sql = getTestDb();
   const [row] = await sql`
     INSERT INTO connections (
       organization_id, connector_key, slug, display_name, status,
       created_by, visibility, created_at, updated_at,
-      device_worker_id, auth_profile_id, credential_mode
+      device_worker_id, auth_profile_id, credential_mode, config
     ) VALUES (
       ${opts.orgId}, ${opts.connectorKey}, ${opts.slug},
       ${`Conn ${opts.slug}`}, 'active', ${opts.userId}, 'org',
       ${opts.createdAt}, ${opts.createdAt},
       ${opts.deviceWorkerId ?? null}, ${opts.authProfileId ?? null},
-      ${opts.credentialMode ?? null}
+      ${opts.credentialMode ?? null},
+      ${
+        opts.config
+          ? sql.json(opts.config)
+          : opts.consentOnly
+            ? sql.json({ consent_only: true })
+            : null
+      }
     )
     RETURNING id
   `;
@@ -945,6 +955,41 @@ describe('connector-health alerter', () => {
     expect(rows.every((row) => row.unhealthy_alerted_at === null)).toBe(true);
   });
 
+  // A consent-only connection holds an OAuth grant for cloud-delegated token
+  // fetch and is FORBIDDEN feeds — the member's data stays on their local
+  // instance, and manage_feeds refuses feeds on one outright. Zero feeds is the
+  // designed state. Measured on prod 2026-09-15 this rule had flagged all 8
+  // active connections of this shape, the oldest since 2026-07-09, and no
+  // operator action could ever have cleared them.
+  it('does not apply the zero-feed rule to a consent-only connection', async () => {
+    const sql = getTestDb();
+    const consentOnly = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'gmail',
+      slug: 'consent-only',
+      createdAt: OLD,
+      consentOnly: true,
+    });
+
+    // Pre-set the marker these rows already carry in prod, so this also pins the
+    // self-heal: the scan clears `unhealthy_alerted_at` whenever a connection
+    // classifies healthy, which means the 8 live false positives need no manual
+    // cleanup — the first scan after this deploys retracts them.
+    await sql`
+      UPDATE connections SET unhealthy_alerted_at = now() - interval '30 days'
+      WHERE id = ${consentOnly.id}
+    `;
+
+    const res = await runConnectorHealthCheck();
+    expect(res.details.some((d) => d.connectionId === consentOnly.id)).toBe(false);
+
+    const [row] = (await sql`
+      SELECT unhealthy_alerted_at FROM connections WHERE id = ${consentOnly.id}
+    `) as unknown as Array<{ unhealthy_alerted_at: Date | null }>;
+    expect(row.unhealthy_alerted_at).toBeNull();
+  });
+
   it('keeps the zero-feed alert fail-closed when the definition is missing', async () => {
     const missingDefinition = await seedConnection({
       orgId,
@@ -1151,5 +1196,164 @@ describe('connector-health alerter', () => {
 
     expect(byId.get(staleMarker.id)).toBeNull();
     expect(byId.get(trueStale.id)).not.toBeNull();
+  });
+
+  // Rule E. Every regression rule above measures a fall from a previous good
+  // state, so a connection that never reached one was invisible to all of them:
+  // Rule A needs a failure, Rule D needs failures, Rule C needs a past success.
+  // A connection whose feeds sit at last_sync_status NULL forever fell straight
+  // through to `return null` and was reported healthy indefinitely.
+  it('flags a connection whose expected feeds have never once synced', async () => {
+    const neverStarted = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'never-started',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: neverStarted.id,
+      feedKey: 'a',
+      lastSyncStatus: null,
+      lastSyncAt: null,
+    });
+
+    const res = await runConnectorHealthCheck();
+    const detail = res.details.find((d) => d.connectionId === neverStarted.id);
+    expect(detail?.reason).toBe('never_collected' satisfies UnhealthyReason);
+    expect(detail?.lastSyncAt).toBeNull();
+  });
+
+  // connections.config is free-form tenant-written jsonb, and this scan is
+  // global: a ::boolean cast on a value like "maybe" would raise and abort the
+  // whole run, silencing health alerting for every org from one malformed row
+  // in one of them. Seeded as a live shape rather than asserted on the SQL text
+  // so the guarantee survives a rewrite of the query.
+  it('survives a non-boolean consent_only without aborting the scan', async () => {
+    const malformed = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'gmail',
+      slug: 'consent-only-garbage',
+      createdAt: OLD,
+      config: { consent_only: 'maybe' },
+    });
+    await seedFeed({
+      orgId,
+      connectionId: malformed.id,
+      feedKey: 'a',
+      lastSyncStatus: null,
+      lastSyncAt: null,
+    });
+
+    // The scan completes at all, and still reaches its verdict for this row:
+    // 'maybe' is not 'true', so the connection is NOT treated as consent-only.
+    const res = await runConnectorHealthCheck();
+    const detail = res.details.find((d) => d.connectionId === malformed.id);
+    expect(detail?.reason).toBe('never_collected' satisfies UnhealthyReason);
+  });
+
+  // A sync claim stamps last_sync_status='pending' and leaves last_sync_at
+  // alone, so a feed mid-run reports no CURRENT success however long it has
+  // been collecting. Keying Rule E on the newest success therefore paged
+  // `never_collected` at a connection that had synced an hour earlier — the
+  // exact false positive this whole change set out to remove, in the one path
+  // that wakes a human.
+  it('does not flag a connection whose feed is mid-run', async () => {
+    const midRun = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'gmail',
+      slug: 'mid-run',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: midRun.id,
+      feedKey: 'a',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(res.details.some((d) => d.connectionId === midRun.id)).toBe(false);
+  });
+
+  // Same root cause, the other shape it produced: a connection that collected
+  // for months and is now failing also has no current success. `all_feeds_
+  // failing` already describes it, and `never_collected` would be plainly
+  // false — measured on prod conn with items_collected > 0 and 27 runs.
+  it('does not call a formerly-collecting connection never-collected', async () => {
+    const regressed = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'notion',
+      slug: 'was-collecting-now-failing',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: regressed.id,
+      feedKey: 'a',
+      lastSyncStatus: 'failed',
+      lastSyncAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
+
+    const res = await runConnectorHealthCheck();
+    const detail = res.details.find((d) => d.connectionId === regressed.id);
+    expect(detail?.reason).not.toBe('never_collected' satisfies UnhealthyReason);
+  });
+
+  // The complement, and the reason the rule is keyed on never-SUCCEEDED rather
+  // than never-PRODUCED: a source that legitimately holds nothing (a mailbox
+  // label with no mail) syncs cleanly and collects zero forever. That is not an
+  // incident, and one successful sync is enough to say so.
+  it('does not flag a connection that syncs successfully but collects nothing', async () => {
+    const emptySource = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'gmail',
+      slug: 'empty-but-syncing',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: emptySource.id,
+      feedKey: 'a',
+      lastSyncStatus: 'success',
+      lastSyncAt: new Date(),
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(res.details.some((d) => d.connectionId === emptySource.id)).toBe(false);
+  });
+
+  // Feed creation is human-paced (measured prod gaps of +11s to +13 days), so a
+  // connection made hours ago has legitimately not synced yet. Aged PAST the
+  // general minimum so it is this rule's own grace window being pinned, not the
+  // shared age floor — same construction as the zero-feed grace test above.
+  it('waits out the grace window before calling a connection never-collected', async () => {
+    expect(cfg.neverCollectedGraceHours).toBeGreaterThan(cfg.minConnectionAgeHours);
+    const fresh = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'apple.photos',
+      slug: 'never-started-but-fresh',
+      createdAt: new Date(
+        Date.now() -
+          ((cfg.minConnectionAgeHours + cfg.neverCollectedGraceHours) / 2) * 60 * 60 * 1000,
+      ),
+    });
+    await seedFeed({
+      orgId,
+      connectionId: fresh.id,
+      feedKey: 'photos',
+      lastSyncStatus: null,
+      lastSyncAt: null,
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(res.details.some((d) => d.connectionId === fresh.id)).toBe(false);
   });
 });
