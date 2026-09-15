@@ -39,9 +39,6 @@ import {
 } from "../orchestration/turn-liveness.js";
 import type { InstructionService } from "../services/instruction-service.js";
 import type { AgentSettingsStore } from "../auth/settings/agent-settings-store.js";
-import {
-  WorkerConnectionManager,
-} from "./connection-manager.js";
 import { createTranscriptRoutes } from "./transcript-routes.js";
 
 const logger = createLogger("worker-gateway");
@@ -64,7 +61,6 @@ export interface DeploymentActivityTracker {
  */
 export class WorkerGateway {
   private app: Hono;
-  private connectionManager: WorkerConnectionManager;
   private queue: IMessageQueue;
   private mcpConfigService: McpConfigService;
   private instructionService: InstructionService;
@@ -87,7 +83,6 @@ export class WorkerGateway {
   ) {
     this.queue = queue;
     this.publicGatewayUrl = publicGatewayUrl;
-    this.connectionManager = new WorkerConnectionManager();
     this.mcpConfigService = mcpConfigService;
     this.instructionService = instructionService;
     this.mcpProxy = mcpProxy;
@@ -105,13 +100,6 @@ export class WorkerGateway {
    */
   getApp(): Hono {
     return this.app;
-  }
-
-  /**
-   * Get the connection manager (for sending SSE notifications from external routes)
-   */
-  getConnectionManager(): WorkerConnectionManager {
-    return this.connectionManager;
   }
 
   /**
@@ -253,10 +241,6 @@ export class WorkerGateway {
 
     const { deploymentName } = auth.tokenData;
 
-    // SSE stale-cleanup clock: every worker HTTP response (including pure
-    // heartbeats) proves the SSE connection is still alive.
-    this.connectionManager.touchConnection(deploymentName);
-
     try {
       const body = await c.req.json();
       const { jobId, ...responseData } = body;
@@ -366,13 +350,14 @@ export class WorkerGateway {
         return c.json({ success: true });
       }
 
-      // The worker's 20s status_update (HEARTBEAT_INTERVAL_MS in
-      // session-runner.ts) carries `statusUpdate` and NO `received` flag, so it
-      // falls through the ACK block above. It is the most frequent worker-driven
-      // liveness signal — far more frequent than the 30s SSE-ping ACK — so it
-      // must refresh the turn-liveness deadline too, otherwise a live worker
-      // emitting status updates every 20s could still lapse the 60s deadline on
-      // ~2 consecutive missed ping ACKs and be falsely failed by the sweep.
+      // A worker status update carries `statusUpdate` and NO `received` flag,
+      // so it falls through the ACK block above. It is a worker-driven liveness
+      // signal and more frequent than the SSE-ping ACK, so it must refresh the
+      // turn-liveness deadline too — otherwise a live worker emitting status
+      // updates could still lapse `turnDefaultDeadlineMs` on a couple of
+      // consecutive missed ping ACKs and be falsely failed by the sweep.
+      // (The isolate `agent_turn` lane does not come through here at all; it
+      // extends its marker from the run heartbeat in `run-lifecycle.ts`.)
       // Best-effort, same as the ACK path.
       if (enrichedResponse.statusUpdate) {
         void extendTurnDeadlines(deploymentName);
@@ -1012,12 +997,5 @@ export class WorkerGateway {
     }
 
     return result;
-  }
-
-  /**
-   * Shutdown gateway
-   */
-  shutdown(): void {
-    this.connectionManager.shutdown();
   }
 }
