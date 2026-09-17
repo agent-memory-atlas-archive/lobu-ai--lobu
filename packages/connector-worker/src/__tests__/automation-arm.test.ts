@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import type { ChildProcess } from 'node:child_process';
+import { type ChildProcess, spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -16,6 +16,7 @@ import {
   type ExecutorResult,
 } from '../daemon/automation.js';
 import {
+  countOwnedGroupSurvivors,
   signalOwnedPosixProcessGroup,
   terminateWindowsProcessTree,
   waitForTargetExitAfterTermination,
@@ -121,6 +122,105 @@ setInterval(() => {}, 1000);
     expect(() =>
       signalOwnedPosixProcessGroup(owner, 'SIGTERM', failWith('EINVAL')),
     ).toThrow();
+  });
+
+  test('counts owned-group survivors apart from the supervisor anchor', () => {
+    if (process.platform === 'win32') return;
+    const owner = { pid: 4242, exitCode: null, signalCode: null };
+    // pid 4242 IS the group leader, so it is the anchor, not a survivor;
+    // 4243 shares its pgid and is the backgrounded descendant; 5000 belongs
+    // to an unrelated group and must never be counted.
+    const table = ['  4242  4242', '  4243  4242', '  5000  5000', ''].join('\n');
+
+    expect(countOwnedGroupSurvivors(owner, () => table)).toBe(1);
+  });
+
+  test('reports no survivors once only the supervisor is left in the group', () => {
+    if (process.platform === 'win32') return;
+    const owner = { pid: 4242, exitCode: null, signalCode: null };
+    const table = ['  4242  4242', '  5000  5000', ''].join('\n');
+
+    expect(countOwnedGroupSurvivors(owner, () => table)).toBe(0);
+  });
+
+  test('a zombie in the owned group is not a survivor', () => {
+    if (process.platform === 'win32') return;
+    const owner = { pid: 4242, exitCode: null, signalCode: null };
+    // 4243 exited already and was never reaped: with the daemon as PID 1 and no
+    // init in front of it, an orphaned grandchild stays a zombie under the
+    // supervisor's pgid. Nothing is running there, so reporting a reap would
+    // fail a run that left nothing behind. 4244 is live and is the one survivor.
+    const table = ['  4242  4242 Ss', '  4243  4242 Z', '  4244  4242 S', ''].join('\n');
+
+    expect(countOwnedGroupSurvivors(owner, () => table)).toBe(1);
+  });
+
+  test('an unreadable process table reports no survivors instead of throwing', () => {
+    if (process.platform === 'win32') return;
+    const owner = { pid: 4242, exitCode: null, signalCode: null };
+
+    // This drives a report field, never the cleanup, so an unavailable `ps`
+    // must degrade quietly rather than break the group SIGKILL that follows.
+    expect(
+      countOwnedGroupSurvivors(owner, () => {
+        throw new Error('ps: command not found');
+      })
+    ).toBe(0);
+  });
+
+  test('the default reader sees a real backgrounded descendant on this host', async () => {
+    if (process.platform === 'win32') return;
+    // Exercises the UNSTUBBED reader -- `/proc` on Linux, `ps` on macOS. A host
+    // that cannot enumerate the process table (a slim image with no procps)
+    // counts zero and silently reports "nothing was reaped": the #3629 bug
+    // shipping inert. Asserting an exact count over a group we really built is
+    // what makes that failure loud here rather than in production.
+    //
+    // The leader is spawned detached, so its pgid is its pid -- the same
+    // invariant the supervisor relies on -- and the grandchild it forks
+    // inherits that group, standing in for work a command backgrounded.
+    const leader = spawn(
+      process.execPath,
+      [
+        '-e',
+        'require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); setInterval(() => {}, 1000);',
+      ],
+      { detached: true, stdio: 'ignore' }
+    );
+    // A spawn failure has to name itself: without a listener the 'error' event
+    // is unhandled and takes the file down, and a missing pid would otherwise
+    // surface five seconds later as a misleading "expected 1, received 0".
+    let spawnError: Error | undefined;
+    leader.once('error', (error) => {
+      spawnError = error;
+    });
+    expect(leader.pid).toBeDefined();
+    const owner = { pid: leader.pid!, exitCode: null, signalCode: null };
+    try {
+      // Wait for the grandchild to actually exist before counting.
+      let survivors = 0;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if (spawnError) throw spawnError;
+        survivors = countOwnedGroupSurvivors(owner);
+        if (survivors > 0) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      // Exactly the grandchild: the leader is the anchor and is never counted.
+      expect(survivors).toBe(1);
+    } finally {
+      try { process.kill(-leader.pid!, 'SIGKILL'); } catch {}
+      try { process.kill(leader.pid!, 'SIGKILL'); } catch {}
+    }
+  }, 15_000);
+
+  test('an exited supervisor claims no survivors from a group it no longer owns', () => {
+    if (process.platform === 'win32') return;
+    // Same reuse hazard as the signal path: 4242 may already belong to someone
+    // else, so its members are not ours to report.
+    const staleOwner = { pid: 4242, exitCode: 0, signalCode: null };
+    const table = ['  4242  4242', '  4243  4242', ''].join('\n');
+
+    expect(countOwnedGroupSurvivors(staleOwner, () => table)).toBe(0);
   });
 });
 

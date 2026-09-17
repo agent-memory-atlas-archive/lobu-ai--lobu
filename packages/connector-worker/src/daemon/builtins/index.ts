@@ -32,6 +32,14 @@ function describeShellFailure(output: ShellRunOutput): string {
   if (output.exit_signal) {
     return `Shell command terminated by ${output.exit_signal}`;
   }
+  // After the failures that name their own cause -- a signal death that also
+  // left survivors is reported as the signal death, with `reaped_descendants`
+  // still on the output -- but before the exit-code default: a reaped run
+  // exits 0, so falling through would report "exited with code 0" as the
+  // reason it failed, the silent loss #3629 exists to remove.
+  if (output.reaped_descendants) {
+    return `Shell command exited with code ${output.exit_code} but left background processes running in its process group; they were killed when the command returned. A command's background work does not outlive the call -- hand a durable process to a host service manager instead.`;
+  }
   return `Shell command exited with code ${output.exit_code}`;
 }
 
