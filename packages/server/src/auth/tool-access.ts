@@ -179,7 +179,7 @@ export const OWNER_ADMIN_ACTIONS: Record<string, Set<string>> = {
 		// caller-supplied content ids — a mutation, same tier as `classify`.
 		"apply",
 	]),
-	manage_view_templates: new Set(["set", "rollback", "remove_tab", "clear"]),
+	manage_views: new Set(["set", "remove"]),
 };
 
 export const PUBLIC_READ_ACTIONS: Record<string, Set<string> | null> = {
@@ -211,7 +211,9 @@ export const PUBLIC_READ_ACTIONS: Record<string, Set<string> | null> = {
 		"get_feedback",
 	]),
 	manage_classifiers: new Set(["list"]),
-	manage_view_templates: new Set(["get"]),
+	// manage_views is deliberately absent: views carry owner-authored
+	// executable source, so reads stay signed-in-only in phase 1 (the public
+	// anonymous bridge arrives in phase 2 with its own design).
 	// `list`/`get` are org-read-gated in the handler (requireOrgReadAccess);
 	// their METHOD_METADATA tier is `read` so query_sdk read mode surfaces them.
 	// The mutating siblings stay owner-admin (OWNER_ADMIN_ACTIONS).

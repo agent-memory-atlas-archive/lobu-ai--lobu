@@ -51,7 +51,7 @@ const TIERED_NAMESPACES = [
 	["operations", "manage_operations", "../../tools/admin/manage_operations", "manageOperations"],
 	["automations", "manage_automations", "../../tools/admin/manage_automations", "manageAutomations"],
 	["classifiers", "manage_classifiers", "../../tools/admin/manage_classifiers", "manageClassifiers"],
-	["viewTemplates", "manage_view_templates", "../../tools/admin/manage_view_templates", "manageViewTemplates"],
+	["views", "manage_views", "../../tools/admin/manage_views", "manageViews"],
 	["catalog", "manage_catalog", "../../tools/admin/manage_catalog", "manageCatalog"],
 	["agents", "manage_agents", "../../tools/admin/manage_agents", "manageAgents"],
 	["schedules", "manage_schedules", "../../tools/admin/manage_schedules", "manageSchedules"],
@@ -183,7 +183,13 @@ function declaredRuntimeTier(
 	// expose conversation titles to anonymous callers, so test the distinction.
 	const authenticatedConversationRead = tool === "manage_conversations" &&
 		(action === "list" || action === "get");
+	// Same shape for views: get/list fall through to the read tier for
+	// members, but view source and bundles must never reach anonymous
+	// callers, so they stay out of PUBLIC_READ_ACTIONS.
+	const authenticatedViewsRead = tool === "manage_views" &&
+		(action === "list" || action === "get");
 	const isExplicitlyDeclared = authenticatedConversationRead ||
+		authenticatedViewsRead ||
 		OWNER_ADMIN_ACTIONS[tool]?.has(action) ||
 		MEMBER_WRITE_ACTIONS[tool]?.has(action) ||
 		PUBLIC_READ_ACTIONS[tool]?.has(action);
@@ -199,6 +205,13 @@ describe("access-model cross-check", () => {
 		for (const action of ["list", "get"]) {
 			expect(getRequiredAccessLevel("manage_conversations", { action }, false)).toBe("read");
 			expect(isPublicReadable("manage_conversations", { action })).toBe(false);
+		}
+	});
+
+	it("keeps view reads authenticated while reporting read tier", () => {
+		for (const action of ["list", "get"]) {
+			expect(getRequiredAccessLevel("manage_views", { action }, false)).toBe("read");
+			expect(isPublicReadable("manage_views", { action })).toBe(false);
 		}
 	});
 
@@ -271,7 +284,7 @@ describe("access-model cross-check", () => {
 				// Only the TIER is derivable. Whether a wrapper is also `external` is
 				// a property of its namespace (does it call out to an external
 				// system?), so entities/entitySchema/agents/schedules/classifiers/
-				// viewTemplates legitimately use a plain tier instead.
+				// views legitimately use a plain tier instead.
 				const expected = OWNER_ADMIN_ACTIONS[tool]?.size ? "admin" : "write";
 				const reported =
 					meta.access === "external" ? meta.enforcedTier : meta.access;
