@@ -213,9 +213,26 @@ jobs:
         # tarball, so pgvector-embedded must build first.
         # Reuse the dependency-layered builder so independent packages build in
         # parallel and new workspace packages cannot drift from an inline list.
-        # Server/Owletto application bundles are not used by the unit suites;
-        # the CLI distribution remains included for cli-ux runtime tests.
+        # Owletto's application bundle is not used by the unit suites; the CLI
+        # distribution remains included for cli-ux runtime tests. The server
+        # bundle IS used by one suite (the runtime-artifact test under
+        # scripts/__tests__) and is built in the next step.
         run: node scripts/build-packages.mjs --skip-applications
+
+      - name: Build server bundle for artifact tests
+        # scripts/__tests__/server-views-vendor.test.ts exercises
+        # buildRuntimeComponents(), which copies
+        # packages/server/dist/server.bundle.mjs (+ server-main + guest) into
+        # the composed artifact. The graph build above uses --skip-applications,
+        # so the bundle is absent on a clean cache and the test fails with
+        # "missing build prerequisite" (PR #3649 run 35402512013). Build just
+        # the server application bundle here; Owletto stays skipped. Runs on
+        # every execution, not just cache misses, because the dist cache only
+        # contains the bundle once some run has built it.
+        run: |
+          if [ ! -f packages/server/dist/server.bundle.mjs ] || [ ! -f packages/server/dist/server-main.bundle.mjs ] || [ ! -f packages/server/dist/guest.bundle.js ]; then
+            cd packages/server && bun run build:server && cd ../..
+          fi
 
       # bunfig.toml routes every `bun test --coverage` run to ./coverage/lcov.info
       # (bun 1.3.x ignores --coverage-dir when bunfig sets coverageDir), so each
@@ -234,6 +251,11 @@ jobs:
         run: |
           bun test packages/core packages/cli --coverage --timeout 30000
           mv coverage/lcov.info coverage/core-cli.lcov.info
+
+      - name: views guest runtime (bun:test)
+        run: |
+          bun test packages/views/src --coverage --timeout 30000
+          mv coverage/lcov.info coverage/views.lcov.info
 
       # Repo tooling guards (merge integrity, release ordering, migration
       # checks, naming gates, the sandbox credential reader). These live in
@@ -321,7 +343,7 @@ jobs:
         if: always()
         uses: codecov/codecov-action@v7
         with:
-          files: coverage/core-cli.lcov.info,coverage/scripts.lcov.info,coverage/plugin-runtime.lcov.info,coverage/server-units.lcov.info,coverage/server-units-auth.lcov.info,coverage/server-units-activity.lcov.info,coverage/server-units-compiler.lcov.info,coverage/connector-worker.lcov.info,coverage/client-promptfoo.lcov.info,coverage/connector-sdk.lcov.info,coverage/connectors.lcov.info,coverage/embeddings.lcov.info
+          files: coverage/core-cli.lcov.info,coverage/scripts.lcov.info,coverage/plugin-runtime.lcov.info,coverage/server-units.lcov.info,coverage/server-units-auth.lcov.info,coverage/server-units-activity.lcov.info,coverage/server-units-compiler.lcov.info,coverage/connector-worker.lcov.info,coverage/client-promptfoo.lcov.info,coverage/connector-sdk.lcov.info,coverage/connectors.lcov.info,coverage/embeddings.lcov.info,coverage/views.lcov.info
           flags: unit
           fail_ci_if_error: false
 
@@ -792,6 +814,10 @@ jobs:
           cd packages/plugin-conversations && bun run build && cd ../..
           cd packages/plugin-media && bun run build && cd ../..
           cd packages/connector-sdk && bun run build && cd ../..
+          # @lobu/views ships real guest runtime to server-side compilation
+          # (packages/server/src/views/views.ts require.resolve); its exports
+          # map points at dist, so compile it like the siblings.
+          cd packages/views && bun run build && cd ../..
           cd packages/embeddings && bun run build && cd ../..
           cd packages/connector-worker && bun run build && cd ../..
           cd packages/pgvector-embedded && bun run build && cd ../..
@@ -923,6 +949,10 @@ jobs:
           cd packages/plugin-conversations && bun run build && cd ../..
           cd packages/plugin-media && bun run build && cd ../..
           cd packages/connector-sdk && bun run build && cd ../..
+          # @lobu/views ships real guest runtime to server-side compilation
+          # (packages/server/src/views/views.ts require.resolve); its exports
+          # map points at dist, so compile it like the siblings.
+          cd packages/views && bun run build && cd ../..
           cd packages/embeddings && bun run build && cd ../..
           cd packages/connector-worker && bun run build && cd ../..
           cd packages/pgvector-embedded && bun run build && cd ../..
