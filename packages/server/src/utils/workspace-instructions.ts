@@ -73,6 +73,7 @@ const DIRECT_MCP_INSTRUCTIONS = [
   '### Writes and approvals',
   '- `save_memory` stores a requested fact or note. Use it only when the user asks to remember or save information, or explicitly confirms a proposed save.',
   '- `run_sdk` can create, update, or delete workspace data and can invoke connector operations. Use it only for a user-requested action; use `query_sdk` for reads and `dry_run=true` to preview supported writes.',
+  '- For connector operations, treat `operation_key` as an opaque manifest identifier: copy it exactly from `operations.listAvailable` and never derive it from the display name. If no returned operation matches, refresh discovery instead of inventing a key.',
   '- A policy-gated operation returns `status: "pending_approval"` and a `run_id`. Call `get_approval` with that run id to show the canonical review card. Treat a pending operation as waiting, not failed.',
   '- Do not infer permission to store conversation details, preferences, personal information, relationships, or files merely because they were mentioned.',
   '- Do not request, expose, or return authentication secrets.',
@@ -253,6 +254,7 @@ export async function buildWorkspaceInstructions(
         // for a separate MCP/HTTP tool that does not exist.
         'Run any connector operation the same way: `run_sdk` → `client.operations.execute({ connection_id, operation_key, input })`. There is no separate per-connector tool.',
         'Discover capabilities with `query_sdk` → `client.operations.listAvailable({ query: "..." })`. It includes disconnected connectors, readiness, and every visible `execution_targets` entry; use the returned target directly instead of guessing a connection id.',
+        'Treat `operation_key` as an opaque manifest identifier: copy it exactly from `operations.listAvailable` and reuse it unchanged in `operations.execute`. Never derive it from an operation display name (for example, a display name like "Check permissions" may have the manifest key `permissions`, not `check_permissions`). If no returned operation matches the requested display name, stop and refresh discovery instead of inventing a key.',
         'When readiness is disconnected, call the returned `next_action`. `connections.connect` / `connections.create` may return `status: "setup_required"`: show its resolved setup/install URL, follow `next_action`, then invoke `resume_call` or poll `completion_check` exactly as returned. When the result carries `self_install_url` (e.g. a Slack app when no hosted app is configured), offer that deep link to the user to create and install their own app and paste back the bot token / signing secret.',
         'When an existing operation or feed reports `setup_required`, show its `reason` / `attention_reason`, ask the user to finish setup on the paired device, then retry the original call. Do not repeatedly retry while setup is still required.',
         'Execution may be policy-gated: a gated op returns `status: "pending_approval"` and a `run_id` queued for a human. Call `get_approval` with that run id to show the canonical review card; treat it as waiting, not failed.'
