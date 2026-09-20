@@ -15,12 +15,17 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { MCP_PROTOCOL_VERSION } from '@lobu/core';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import type { AnyObjectSchema, SchemaOutput } from '@modelcontextprotocol/sdk/server/zod-compat.js';
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import {
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
+  type Notification as McpNotification,
+  type Request as McpRequest,
+  type Result as McpResult,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { Context } from 'hono';
 import { OAuthClientsStore } from './auth/oauth/clients';
@@ -49,7 +54,7 @@ import {
   clearInMemoryMcpSessionsForTests as clearInMemoryMcpSessionsForTestsShared,
   mcpSessionMap,
 } from './mcp-session-state';
-import { McpSessionStore, type PersistedMcpSession } from './mcp-session-store';
+import { MCP_SESSION_MAX_AGE_MS, McpSessionStore, type PersistedMcpSession } from './mcp-session-store';
 import { LOBU_SKILL_MARKDOWN } from './skills/lobu-skill.generated';
 import { readMcpAttachmentResource } from './mcp-media-resources';
 import { isAdminOrOwnerRole } from './tools/access-control';
@@ -77,11 +82,11 @@ import {
 import { resolvePublicOrigin } from './utils/public-origin';
 import { buildWorkspaceInstructions } from './utils/workspace-instructions';
 import { listLiveGrantedMemberWorkspaces } from './auth/oauth/workspace-grants';
+import logger from './utils/logger';
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-const SESSION_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
 const SESSION_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
 const MCP_APP_EXTENSION_ID = 'io.modelcontextprotocol/ui';
@@ -153,7 +158,7 @@ function stripCapabilityCompatMeta(
 setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of sessions) {
-    if (now - entry.lastAccessedAt > SESSION_MAX_AGE_MS) {
+    if (now - entry.lastAccessedAt > MCP_SESSION_MAX_AGE_MS) {
       sessions.delete(id);
       entry.transport.close?.();
     }
@@ -207,8 +212,23 @@ export async function revokeInMemoryMcpSessionsForClient(
 // Build a low-level Server wired to our tool registry + auth context
 // ---------------------------------------------------------------------------
 
-/** Request-local response formatting; concurrent MCP sessions must never race. */
-const mcpRequestFormat = new AsyncLocalStorage<{ rawJson: boolean }>();
+/** HTTP context follows SDK dispatch without sharing state between requests. */
+const mcpRequestContext = new AsyncLocalStorage<{
+  rawJson: boolean;
+  signal: AbortSignal;
+  renewActivity?: () => Promise<boolean>;
+}>();
+
+class SessionServer extends Server {
+  override setRequestHandler<T extends AnyObjectSchema>(
+    schema: T,
+    handler: (request: SchemaOutput<T>, extra: RequestHandlerExtra<McpRequest, McpNotification>) => McpResult | Promise<McpResult>
+  ): void {
+    // This also wraps the SDK's built-in handlers registered by super().
+    super.setRequestHandler(schema, (request, extra) =>
+      withRequestActivity(extra.signal, () => handler(request, extra)));
+  }
+}
 
 /**
  * MCP Apps UI resources (interactive iframe payloads a host renders in a
@@ -395,7 +415,7 @@ function createServerForContext(
   authCtx: SessionAuthContext,
   mcpAppsSupported: boolean
 ): Server {
-  const server = new Server(
+  const server = new SessionServer(
     { name: 'lobu-mcp', version: '0.2.0' },
     {
       capabilities: { tools: {}, resources: {} },
@@ -648,7 +668,7 @@ function createServerForContext(
         name === 'run_sdk' || name === 'query_sdk'
           ? toMcpPublicSdkScriptResult(result)
           : result;
-      const text = mcpRequestFormat.getStore()?.rawJson
+      const text = mcpRequestContext.getStore()?.rawJson
         ? JSON.stringify(publicResult)
         : formatToolResult(name, publicResult, { includeRawJson: false });
       // When the tool declares an `outputSchema`, also return the result as
@@ -901,7 +921,7 @@ function buildPersistedSession(
     supportsMcpApps: authCtx.supportsMcpApps ?? false,
     supportsAppSandboxDomain: authCtx.supportsAppSandboxDomain ?? false,
     lastAccessedAt,
-    expiresAt: lastAccessedAt + SESSION_MAX_AGE_MS,
+    expiresAt: lastAccessedAt + MCP_SESSION_MAX_AGE_MS,
   };
 }
 
@@ -1169,6 +1189,7 @@ function normalizeAcceptHeader(req: Request): Request {
     method: req.method,
     headers,
     body: req.body,
+    signal: req.signal,
     duplex: 'half',
   });
 }
@@ -1179,7 +1200,11 @@ function normalizeAcceptHeader(req: Request): Request {
 // -----------------------------------------------------------------------------
 const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 
-export function withSSEHeartbeat(response: Response, signal?: AbortSignal): Response {
+export function withSSEHeartbeat(
+  response: Response,
+  signal?: AbortSignal,
+  onActivity?: () => Promise<void>
+): Response {
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) {
     return response;
   }
@@ -1205,18 +1230,26 @@ export function withSSEHeartbeat(response: Response, signal?: AbortSignal): Resp
   // call.
   let terminated = false;
   let intervalId: NodeJS.Timeout | undefined;
+  const sourceAbort = new AbortController();
+  let detachAbortBridge = () => {};
   const closeWriter = () => {
     if (terminated) return;
     terminated = true;
     if (intervalId) clearInterval(intervalId);
+    detachAbortBridge();
     writer.close().catch(() => undefined);
   };
   const abortWriter = (reason: unknown) => {
     if (terminated) return;
     terminated = true;
     if (intervalId) clearInterval(intervalId);
+    detachAbortBridge();
+    sourceAbort.abort(reason);
     writer.abort(reason).catch(() => undefined);
   };
+  // Consumer cancellation must cancel the SDK source too, releasing its GET
+  // stream slot even when no write is pending to notice the disconnect.
+  writer.closed.catch(abortWriter);
 
   // Bridge the per-request AbortSignal so abnormal disconnects (LB idle
   // timeout, proxy kill, client hard-close) actually clear the heartbeat
@@ -1237,11 +1270,20 @@ export function withSSEHeartbeat(response: Response, signal?: AbortSignal): Resp
   // Create the interval BEFORE binding the abort signal so that a pre-aborted
   // signal triggers abortWriter() → clearInterval(intervalId) instead of
   // leaving the timer running forever (codex audit, follow-up to #864).
+  let heartbeatPending = false;
   intervalId = setInterval(() => {
-    writer.write(heartbeat).catch(() => abortWriter(new Error('SSE heartbeat write failed')));
+    // Backpressure is not activity. Keep only one outstanding heartbeat and
+    // renew the session only after the consumer accepts it.
+    if (heartbeatPending || terminated) return;
+    heartbeatPending = true;
+    writer.write(heartbeat)
+      .then(() => terminated ? undefined : onActivity?.())
+      .catch(abortWriter)
+      .finally(() => { heartbeatPending = false; });
   }, SSE_HEARTBEAT_INTERVAL_MS);
+  intervalId.unref();
 
-  const detachAbortBridge = bindRequestAbortToStream(signal, adapter);
+  detachAbortBridge = bindRequestAbortToStream(signal, adapter);
 
   response.body
     .pipeTo(
@@ -1257,7 +1299,8 @@ export function withSSEHeartbeat(response: Response, signal?: AbortSignal): Resp
           detachAbortBridge();
           abortWriter(reason);
         },
-      })
+      }),
+      { signal: sourceAbort.signal }
     )
     .catch(() => {
       detachAbortBridge();
@@ -1270,19 +1313,72 @@ export function withSSEHeartbeat(response: Response, signal?: AbortSignal): Resp
   });
 }
 
-// Wrap transport.handleRequest. POST responses are always JSON (the transport
-// is built with `enableJsonResponse: true`); only the standalone GET
-// notification stream is SSE, and that is what the heartbeat below keeps alive.
+async function refreshTransportActivity(
+  transport: WebStandardStreamableHTTPServerTransport
+): Promise<boolean> {
+  const id = transport.sessionId;
+  const entry = id ? sessions.get(id) : undefined;
+  if (!id || entry?.transport !== transport) return false;
+  if (!(await mcpSessionStore.refreshActivity(id))) return false;
+  entry.lastAccessedAt = Math.max(entry.lastAccessedAt, Date.now());
+  return true;
+}
+
+async function withRequestActivity<T>(signal: AbortSignal, handler: () => T | Promise<T>): Promise<T> {
+  const context = mcpRequestContext.getStore();
+  if (!context?.renewActivity) return handler();
+  const { renewActivity } = context;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let refreshing = false;
+  const stop = () => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    signal.removeEventListener('abort', stop);
+    context.signal.removeEventListener('abort', stop);
+  };
+  // SDK cancellation/transport close aborts the handler signal but suppresses
+  // its JSON response, leaving handleRequest pending. Own renewal here instead.
+  if (!signal.aborted && !context.signal.aborted) {
+    timer = setInterval(async () => {
+      if (refreshing || !timer) return;
+      refreshing = true;
+      try {
+        if (!(await renewActivity())) stop();
+      } catch (err) {
+        logger.warn({ err }, 'Failed to refresh in-flight MCP session activity');
+      } finally {
+        refreshing = false;
+      }
+    }, SSE_HEARTBEAT_INTERVAL_MS);
+    timer.unref();
+    signal.addEventListener('abort', stop, { once: true });
+    context.signal.addEventListener('abort', stop, { once: true });
+  }
+  try {
+    return await handler();
+  } finally {
+    stop();
+  }
+}
+
+// POST responses are JSON; only the standalone GET notification stream is SSE.
 async function handleTransportRequest(
   transport: WebStandardStreamableHTTPServerTransport,
   req: Request
 ): Promise<Response> {
-  const rawJson = req.headers.get('x-mcp-format')?.toLowerCase() === 'json';
-  const response = await mcpRequestFormat.run({ rawJson }, () => transport.handleRequest(req));
+  const response = await mcpRequestContext.run({
+    rawJson: req.headers.get('x-mcp-format')?.toLowerCase() === 'json',
+    signal: req.signal,
+    // Initialization has no persisted row yet and must not create one here.
+    renewActivity: req.method === 'POST' && transport.sessionId
+      ? () => refreshTransportActivity(transport) : undefined,
+  }, () => transport.handleRequest(req));
   // Inject SSE heartbeat pings to keep the stream alive through proxies.
   // Thread the inbound request's AbortSignal so abnormal disconnects clear
   // the interval (same root cause as PR #833/#845).
-  return withSSEHeartbeat(response, req.signal);
+  return withSSEHeartbeat(response, req.signal, async () => {
+    if (!(await refreshTransportActivity(transport))) await transport.close();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1445,9 @@ function createSessionTransport(
     // session guard. JSON responses avoid that split delivery path while the
     // standalone GET stream remains available for notifications.
     enableJsonResponse: true,
+    // The SDK invokes this hook for an explicit protocol DELETE. A pod-local
+    // close/eviction must preserve another replica's active/recoverable row.
+    onsessionclosed: (id) => deletePersistedSession(id),
     onsessioninitialized: (id) => {
       // The per-session authCtx object is shared by every request on this
       // session, so stamping once here threads the session id into each
@@ -1363,9 +1462,8 @@ function createSessionTransport(
     },
   });
   transport.onclose = () => {
-    if (transport.sessionId) {
+    if (transport.sessionId && sessions.get(transport.sessionId)?.transport === transport) {
       sessions.delete(transport.sessionId);
-      void deletePersistedSession(transport.sessionId);
     }
   };
   const server = createServerForContext(env, authCtx, authCtx.supportsMcpApps ?? false);
