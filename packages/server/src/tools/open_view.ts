@@ -1,8 +1,12 @@
 import { type Static, Type } from "@sinclair/typebox";
-import { ViewKeySchema } from "@lobu/core/contracts/tools/manage-views";
+import {
+	type ViewAttachment,
+	ViewKeySchema,
+} from "@lobu/core/contracts/tools/manage-views";
 import type { Env } from "../index";
 import { ToolUserError } from "../utils/errors";
 import { resolvePublicOrigin } from "../utils/public-origin";
+import { viewPathSuffix } from "@lobu/core/contracts/tools/view-path";
 import { getOrganizationSlug } from "../utils/url-builder";
 import { getView, viewResourceUri } from "../views/views";
 import { getDb } from "../db/client";
@@ -91,6 +95,99 @@ function resolveViewParams(
 	return resolved;
 }
 
+type StoredView = NonNullable<Awaited<ReturnType<typeof getView>>>;
+
+const isTab = (a: ViewAttachment) => (a.placement ?? "tab") === "tab";
+
+/**
+ * The page that renders `view` for `scope`, chosen from the view's attachments
+ * exactly as the web host selects them, so the link never lands on a
+ * "no view named …" page: the Data hub mounts workspace views, a type page its
+ * type's tabs, a record page its tabs plus Overview cards.
+ */
+async function resolveViewPath(
+	view: StoredView,
+	scope: { type?: string; entity?: number },
+	orgSlug: string,
+	organizationId: string
+): Promise<{ pathname: string; card: boolean }> {
+	const suffix = viewPathSuffix(view.key);
+	const sql = getDb();
+	if (scope.entity !== undefined) {
+		const rows = await sql<{
+			entity_type: string;
+			slug: string;
+			parent_id: number | null;
+		}>`
+      SELECT et.slug AS entity_type, e.slug, e.parent_id
+      FROM entities e
+      JOIN entity_types et ON et.id = e.entity_type_id
+      WHERE e.id = ${scope.entity}
+        AND e.organization_id = ${organizationId}
+        AND e.deleted_at IS NULL
+      LIMIT 1
+    `;
+		const row = rows[0];
+		if (!row) {
+			throw new ToolUserError(`Entity ${scope.entity} not found`, 404);
+		}
+		// A slug pin names a top-level record: slugs are unique per parent.
+		const onRecord = (a: ViewAttachment) =>
+			"entity" in a
+				? typeof a.entity === "number"
+					? a.entity === scope.entity
+					: row.parent_id === null && a.entity === row.slug
+				: "type" in a && a.type === row.entity_type;
+		const recordPath = `/${orgSlug}/${row.entity_type}/${row.slug}`;
+		const matches = view.attach.filter(onRecord);
+		if (matches.some(isTab)) return { pathname: `${recordPath}${suffix}`, card: false };
+		// An Overview card renders on the record page itself, with its defaults.
+		if (matches.length > 0) return { pathname: recordPath, card: true };
+		throw new ToolUserError(
+			`View '${view.key}' is not attached to entity ${scope.entity}`,
+			400
+		);
+	}
+	if (scope.type !== undefined) {
+		const rows = await sql<{ id: number }>`
+      SELECT id FROM entity_types
+      WHERE slug = ${scope.type}
+        AND deleted_at IS NULL
+        AND organization_id = ${organizationId}
+      LIMIT 1
+    `;
+		if (rows.length === 0) {
+			throw new ToolUserError(`Entity type '${scope.type}' not found`, 404);
+		}
+		if (view.attach.some((a) => "type" in a && a.type === scope.type && isTab(a))) {
+			return { pathname: `/${orgSlug}/${scope.type}${suffix}`, card: false };
+		}
+		throw new ToolUserError(
+			`View '${view.key}' is not a tab on type '${scope.type}'`,
+			400
+		);
+	}
+	if (view.attach.some((a) => "workspace" in a)) {
+		return { pathname: `/${orgSlug}/data${suffix}`, card: false };
+	}
+	// No workspace attachment: the view's one type tab is its only page.
+	const typeTabs = [
+		...new Set(
+			view.attach.flatMap((a) => ("type" in a && isTab(a) ? [a.type] : []))
+		),
+	];
+	if (typeTabs.length === 1) {
+		// Resolved as an explicit scope.type, so a deleted type is refused.
+		return resolveViewPath(view, { type: typeTabs[0] }, orgSlug, organizationId);
+	}
+	throw new ToolUserError(
+		typeTabs.length > 1
+			? `View '${view.key}' is a tab on several types (${typeTabs.join(", ")}); pass scope.type`
+			: `View '${view.key}' has no page of its own; pass scope.entity for a record it attaches to`,
+		400
+	);
+}
+
 async function openViewImpl(
 	args: OpenViewArgs,
 	_env: Env,
@@ -102,47 +199,36 @@ async function openViewImpl(
 		throw new ToolUserError(`Unknown view: ${args.key}`, 404);
 	}
 	const scope = args.scope ?? {};
-	let pathname: string;
 	const orgSlug =
 		(await getOrganizationSlug(target.organizationId)) ?? target.organizationId;
-	if (scope.entity !== undefined) {
-		const sql = getDb();
-		const rows = await sql<{ entity_type: string; slug: string }>`
-      SELECT et.slug AS entity_type, e.slug
-      FROM entities e
-      JOIN entity_types et ON et.id = e.entity_type_id
-      WHERE e.id = ${scope.entity}
-        AND e.organization_id = ${target.organizationId}
-        AND e.deleted_at IS NULL
-      LIMIT 1
-    `;
-		const row = rows[0];
-		if (!row) {
-			throw new ToolUserError(`Entity ${scope.entity} not found`, 404);
-		}
-		pathname = `/${orgSlug}/${row.entity_type}/${row.slug}`;
-	} else if (scope.type !== undefined) {
-		const sql = getDb();
-		const rows = await sql<{ id: number }>`
-      SELECT id FROM entity_types
-      WHERE slug = ${scope.type}
-        AND deleted_at IS NULL
-        AND organization_id = ${target.organizationId}
-      LIMIT 1
-    `;
-		if (rows.length === 0) {
-			throw new ToolUserError(`Entity type '${scope.type}' not found`, 404);
-		}
-		pathname = `/${orgSlug}/${scope.type}`;
-	} else {
-		pathname = `/${orgSlug}`;
-	}
+	const { pathname, card } = await resolveViewPath(
+		view,
+		scope,
+		orgSlug,
+		target.organizationId
+	);
 	const params = resolveViewParams(view, args.params);
+	if (card) {
+		// The record page mounts a card with its defaults and nothing else, so a
+		// link carrying other values would render something different.
+		const defaults = resolveViewParams(view, undefined);
+		const overridden = Object.keys(params).filter((k) => params[k] !== defaults[k]);
+		if (overridden.length > 0) {
+			throw new ToolUserError(
+				`View '${view.key}' renders as an Overview card on that record, which takes no params (${overridden.join(", ")})`,
+				400
+			);
+		}
+	}
 	const origin = resolvePublicOrigin(
 		ctx.requestUrl ?? ctx.baseUrl ?? "http://127.0.0.1"
 	);
-	const search = new URLSearchParams({ view: args.key });
-	for (const [k, v] of Object.entries(params)) search.set(k, String(v));
+	// The view is the path; the query string is its params and nothing else.
+	const search = new URLSearchParams();
+	if (!card) {
+		for (const [k, v] of Object.entries(params)) search.set(k, String(v));
+	}
+	const query = search.toString();
 	return {
 		view: args.key,
 		scope: {
@@ -150,7 +236,7 @@ async function openViewImpl(
 			...(scope.entity !== undefined ? { entity: scope.entity } : {}),
 		},
 		params,
-		url: `${origin}${pathname}?${search.toString()}`,
+		url: `${origin}${pathname}${query ? `?${query}` : ""}`,
 		resource: viewResourceUri(args.key),
 	};
 }

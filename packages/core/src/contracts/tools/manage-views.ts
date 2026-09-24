@@ -44,15 +44,15 @@ export const ViewAttachmentSchema = Type.Union([
   }),
   Type.Object({
     workspace: Type.Literal(true, {
-      description: "Workspace page at /pages/<slug> with a sidebar entry.",
+      description: "A tab on the Data hub, at /data/-/views/<key>.",
     }),
     placement: ViewPlacementSchema,
   }),
 ]);
 export type ViewAttachment = Static<typeof ViewAttachmentSchema>;
 
-// Declared, typed URL params. Unknown params are ignored; `view` and
-// `version` are reserved on type/record pages and cannot be declared.
+// Declared, typed URL params. Unknown params are ignored; `peek` and `peek_*`
+// are reserved (the web shell's peek pane reads them on every page).
 export const ViewParamDeclSchema = Type.Object({
   type: Type.Union(
     [Type.Literal("string"), Type.Literal("number"), Type.Literal("boolean")],

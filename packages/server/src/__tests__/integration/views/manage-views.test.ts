@@ -24,6 +24,7 @@ import { initWorkspaceProvider } from "../../../workspace";
 import { cleanupTestDatabase, getTestDb } from "../../setup/test-db";
 import {
 	addUserToOrganization,
+	createTestEntity,
 	createTestOrganization,
 	createTestUser,
 } from "../../setup/test-fixtures";
@@ -359,8 +360,12 @@ mountView(view, V);
 		await expect(
 			setView(SIMPLE_SOURCE, { key: "Custom:Name" })
 		).rejects.toThrow(/key/i);
+		// The shell's peek pane reads peek/peek_* on every page, view paths too.
 		await expect(
-			setView(SIMPLE_SOURCE, { params: { view: { type: "string" } } })
+			setView(SIMPLE_SOURCE, { params: { peek: { type: "string" } } })
+		).rejects.toThrow(/reserved/);
+		await expect(
+			setView(SIMPLE_SOURCE, { params: { peek_entity: { type: "string" } } })
 		).rejects.toThrow(/reserved/);
 		await expect(
 			setView(SIMPLE_SOURCE, {
@@ -418,6 +423,13 @@ mountView(view, V);
 		};
 		const set = await setView(SIMPLE_SOURCE, { params });
 		expect(set.written).toBe(true);
+		// open_view links the view's `deal` tab, so the type has to exist.
+		await createTestEntity({
+			name: "Acme renewal",
+			entity_type: "deal",
+			organization_id: orgId,
+			created_by: ownerId,
+		});
 		const opened = (await executeTool(
 			"open_view",
 			{ key: "pipeline" },
