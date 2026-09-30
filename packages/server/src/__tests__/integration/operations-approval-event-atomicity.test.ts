@@ -76,7 +76,6 @@ describe("approval-event atomicity (item 16)", () => {
 				needs_approval: {
 					name: "Needs approval",
 					kind: "write",
-					requiresApproval: true,
 				},
 			})},
 			supports_execute = true
@@ -207,6 +206,42 @@ describe("approval-event atomicity (item 16)", () => {
 
 		// And NO new approval event was written (the failed insert rolled back with
 		// the run; the only pre-existing one is the happy-path event from test 1).
+		const eventsAfter = await sql`
+			SELECT count(*)::int AS n FROM events
+			WHERE organization_id = ${orgId}
+			  AND interaction_type = 'approval'
+			  AND connector_key = ${CONNECTOR}
+		`;
+		expect(eventsAfter[0].n).toBe(eventsBefore[0].n);
+	});
+
+	it("notification write failure rolls back the pending run and approval card", async () => {
+		const sql = getTestDb();
+		const before = await sql`SELECT count(*)::int AS n FROM runs WHERE organization_id = ${orgId} AND connector_key = ${CONNECTOR}`;
+		const eventsBefore = await sql`
+			SELECT count(*)::int AS n FROM events
+			WHERE organization_id = ${orgId}
+			  AND interaction_type = 'approval'
+			  AND connector_key = ${CONNECTOR}
+		`;
+
+		// Fail only the admin inbox insert, which now shares the run + card transaction.
+		await sql.unsafe(
+			FAIL_TRIGGER.replace(
+				"NEW.interaction_type = 'approval'",
+				"NEW.metadata->>'notification_type' = 'action_approval_needed'",
+			),
+		);
+		await expect(
+			manageOperations(
+				{ action: "execute", connection_id: connectionId, operation_key: "needs_approval", input: {} },
+				{} as Env,
+				ctx,
+			),
+		).rejects.toThrow(/approval-event write failure/);
+
+		const after = await sql`SELECT count(*)::int AS n FROM runs WHERE organization_id = ${orgId} AND connector_key = ${CONNECTOR}`;
+		expect(after[0].n).toBe(before[0].n);
 		const eventsAfter = await sql`
 			SELECT count(*)::int AS n FROM events
 			WHERE organization_id = ${orgId}

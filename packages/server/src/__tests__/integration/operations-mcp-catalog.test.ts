@@ -1,6 +1,7 @@
 import { MCP_PROTOCOL_VERSION } from "@lobu/core";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { app, type Env } from "../../index";
+import { upsertEntityApprovalPolicy } from "../../authz/entity-policy";
 import { listOrgInstalled } from "../../catalog/installed";
 import { getOperationsSummary, getOperationsSummaryBatch, listOperations } from "../../operations/connector-operations";
 import { manageOperations } from "../../tools/admin/manage_operations";
@@ -142,7 +143,10 @@ describe("connection-scoped MCP catalog", () => {
 		const tools = Array.from({ length: 105 }, (_, i) => tool(`operation_${i}`));
 		const first = await account(tools);
 		await account(tools);
-		await getTestDb()`UPDATE connections SET config = '{"action_modes":{"operation_104":"disabled"}}'::jsonb WHERE id = ${first.id}`;
+		await upsertEntityApprovalPolicy(owner.org.id, {
+			resourceClass: "connector_action", connectionId: first.id,
+			operationKey: `${KEY}::operation_104`, effects: { execute: "deny" },
+		});
 		const firstPage = await list();
 		const lastPage = await list({ offset: 100 });
 		expect(firstPage.total).toBe(105);
@@ -150,9 +154,25 @@ describe("connection-scoped MCP catalog", () => {
 		expect(lastPage.total).toBe(105);
 		expect(lastPage.operations).toHaveLength(5);
 		expect(lastPage.operations[4].execution_targets).toMatchObject([
-			{ connection_id: first.id, executable: false, status: "disabled" },
+			{ connection_id: first.id, executable: false, status: "blocked" },
 			{ executable: true, status: "ready" },
 		]);
+	});
+
+	it("hides blocked account-only descriptors even when another account is allowed", async () => {
+		const blocked = await account([tool("blocked_only"), tool("variant", "blocked")]);
+		await account([tool("visible"), tool("variant", "allowed")]);
+		await upsertEntityApprovalPolicy(owner.org.id, {
+			resourceClass: "connector_action", connectionId: blocked.id, effects: { execute: "deny" },
+		});
+		const agent = await createTestAgent({ organizationId: owner.org.id, ownerUserId: owner.user.id });
+		const result = await manageOperations(
+			{ action: "list_available", connector_key: KEY }, {} as Env,
+			{ ...owner.ctx, agentId: agent.agentId },
+		) as { operations: Array<Record<string, any>>; total: number };
+		expect(result.total).toBe(2);
+		expect(result.operations.map((op) => op.operation_key)).toEqual(["variant", "visible"]);
+		expect(result.operations[0].input_schema.properties).toEqual({ allowed: { type: "string" } });
 	});
 
 	it("does not anonymously probe a protected connector without visible active connections", async () => {

@@ -1,26 +1,43 @@
 /**
- * The operation ledger card for a run that needs NO human approval.
- *
- * `events` with `semantic_type='operation'` is the audit trail for connector
- * operations, and it was written only on the approval-queued branch. Auto is
- * the mode `resolveActionMode` returns for every read and every
- * `requiresApproval: false` write, plus anything a human set to `auto` in
- * `connection.config.action_modes` — so the runs that left no trace at all
- * were the majority, and the only ones that did were the ones a human had
- * already seen.
- *
- * An auto run gets the SAME card family as a queued one
- * (`semantic_type='operation'`, `interaction_type='approval'`) so every
- * existing reader, permalink and supersede path keeps working unchanged. Its
- * chain is shorter and starts one state later: a queued run runs
- * pending → approved → completed, an auto run starts at `approved` because the
- * connection's `action_modes` granted that approval in advance (the same fact
- * `runs.approval_status='auto'` records) and there is no decision left to make.
+ * Auto operations use the same append-only ledger cards as approval runs.
+ * Their card starts at auto_approved because organization policy admitted
+ * execution, then follows the shared completion and failure transitions.
  */
 
+import { deepRedactSecrets, isSecretKey, REDACTED_SENTINEL } from "@lobu/core";
 import { getDb } from "../db/client";
+import { ApprovalKind, approvalContext, highApprovalImpact, normalApprovalImpact } from "../utils/approval-context";
+import type { OperationDescriptor } from "./types";
 import { runLeaseFence } from "../runs/run-lease";
 import { supersedeActionEvent } from "../tools/admin/approval-events";
+
+/** The same review details apply whether Ask is decided at admission or dispatch. */
+export function connectorApprovalMetadata(
+	connectionName: string,
+	operation: Pick<OperationDescriptor, "name" | "annotations">,
+	input: Record<string, unknown>,
+) {
+	return {
+		...approvalContext(
+			ApprovalKind.Connector,
+			operation.annotations?.destructiveHint === true
+				? highApprovalImpact(
+					"This action can remove or irreversibly change data in the connected service.",
+					["Lobu may not be able to undo the external change."],
+				)
+				: normalApprovalImpact(),
+		),
+		review_fields: [
+			{ key: "resource", value: "Connector operation" },
+			{ key: "connection", value: connectionName },
+			{ key: "operation", value: operation.name },
+			...Object.entries(input).map(([key, value]) => ({
+				key: `input_${key}`,
+				value: value != null && isSecretKey(key) ? REDACTED_SENTINEL : deepRedactSecrets(value),
+			})),
+		],
+	};
+}
 
 /**
  * Origin id of the dispatch card a non-queued operation run writes. Source

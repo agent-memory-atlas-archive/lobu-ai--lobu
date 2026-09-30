@@ -3286,11 +3286,10 @@ describe("prepare_comment helpers", () => {
     expect(expr).toContain("root.remove()");
   });
 
-  test("definition lets prepare_comment stage without a redundant approval gate", () => {
+  test("definition declares prepare_comment as a non-destructive write", () => {
     const c = new LinkedInConnector();
     const action = c.definition.actions?.prepare_comment;
     expect(action?.key).toBe("prepare_comment");
-    expect(action?.requiresApproval).toBe(false);
     expect(action?.kind).toBe("write");
     expect(action?.annotations?.destructiveHint).toBe(false);
     expect(action?.inputSchema?.anyOf).toEqual([
@@ -3310,7 +3309,6 @@ describe("prepare_comment helpers", () => {
     const c = new LinkedInConnector();
     const action = c.definition.actions?.verify_staged_comment;
     expect(action?.key).toBe("verify_staged_comment");
-    expect(action?.requiresApproval).toBe(false);
     expect(action?.kind).toBe("read");
     expect(action?.annotations?.destructiveHint).toBe(false);
     expect(action?.annotations?.idempotentHint).toBe(true);
