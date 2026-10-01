@@ -788,6 +788,7 @@ export class ChatInstanceManager {
     await this.persistConnection(connection);
     const reread = await this.connectionStore.getConnection(id);
     if (!reread) throw new Error(`Connection ${id} disappeared during update`);
+    connection.updatedAt = reread.updatedAt;
 
     if (
       needsRestart &&
@@ -1563,12 +1564,7 @@ export class ChatInstanceManager {
     }
 
     try {
-      const accepted = request.clone();
-      const response = await webhookHandler(request);
-      if (response.ok && stored) {
-        await getPlatformDescriptor(platform)?.onWebhookAccepted?.(stored, accepted, this.runtimeDeps());
-      }
-      return response;
+      return await webhookHandler(request);
     } catch (error) {
       logger.error(
         { connectionId, platform, error: String(error) },
@@ -1790,9 +1786,10 @@ export class ChatInstanceManager {
         }
         if (Object.keys(metadataUpdate).length > 0) {
           Object.assign(connection.metadata, metadataUpdate);
-          await this.updateConnection(connection.id, {
+          const updated = await this.updateConnection(connection.id, {
             metadata: metadataUpdate,
           });
+          connection.updatedAt = updated.updatedAt;
         }
       } catch {
         // non-critical
@@ -1855,6 +1852,13 @@ export class ChatInstanceManager {
       : undefined;
     const adapter = await descriptor.createAdapter(connection.config, {
       webhookUrl: runtime?.webhookUrl ?? webhookUrl,
+      onWebhookAccepted: descriptor.onWebhookAccepted ? async (request) => {
+        const stored = await this.runtimeDeps().getConnection(connection.id);
+        if (!stored || stored.status !== "active" || stored.organizationId !== connection.organizationId || stored.updatedAt !== connection.updatedAt) {
+          return new Response("Chat connection is unavailable", { status: 403 });
+        }
+        return descriptor.onWebhookAccepted!(stored, request, this.runtimeDeps());
+      } : undefined,
       runtime: runtime ? {
         ...runtime,
         refresh: async () => {
@@ -2066,10 +2070,16 @@ export class ChatInstanceManager {
     // instance down and re-hydrates (re-running setWebhook/setMyCommands).
     const afterStart = await this.resolveStored(stored.id);
     instance.rowVersion = afterStart?.updatedAt ?? stored.updatedAt;
+    instance.connection.updatedAt = instance.rowVersion;
     if (stored.status === "error") {
       await this.writeConnectionStatus(stored, "active", undefined);
       const reread = await this.resolveStored(stored.id);
-      if (reread) instance.rowVersion = reread.updatedAt;
+      if (reread) {
+        instance.rowVersion = reread.updatedAt;
+        instance.connection.updatedAt = reread.updatedAt;
+        instance.connection.status = reread.status as PlatformConnection["status"];
+        instance.connection.errorMessage = reread.errorMessage;
+      }
       logger.info({ id: stored.id }, "Recovered previously-errored connection");
     }
   }
