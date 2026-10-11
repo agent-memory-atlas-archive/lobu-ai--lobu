@@ -11,9 +11,10 @@
  *
  * This module is a periodic, read-only scan over `connections` + `feeds` that
  * classifies each active connection as healthy or unhealthy by clear rules and
- * emits a structured `logger.error` for each NEWLY-unhealthy connection. That
- * `logger.error` is forwarded by the pino→Sentry bridge (`utils/logger.ts`) to
- * the existing Sentry→Slack alert path — no new alerting infra.
+ * emits a structured `logger.error` for each NEWLY-unhealthy connection, which
+ * lands in the hosted log pipeline (Loki). Because no log reaches the org's own
+ * admins, the same transition also sends them an in-product notification when
+ * a connection that was collecting has stopped.
  *
  * ACL sync failures ride this same path: a connection whose ACL graph is
  * fail-closed (`authz_source_acl_state.freshness_state='failed'` — the ACL sync
@@ -69,7 +70,7 @@
  * `threads` ~every 2.6h). Replaying both predicates over that snapshot, gating
  * this scan on `execution_mode === 'scheduled'` drops its coverage from 43
  * connections to 14 and silences the exact shape it exists for (connection 412,
- * 10 of 11 feeds failing) — so `schedule` is deliberately not read here.
+ * 10 of 11 feeds failing) — so `schedule` cannot gate which feeds count here.
  * `schedule` alone therefore cannot be this scan's predicate, and still is not.
  * (`deriveFeedHealthSemantics` used to publish an `incidentEligible` flag built
  * on that same inference. Nothing consumed it and it disagreed with this scan,
@@ -85,8 +86,13 @@
  */
 
 import { type DbClient, getDb, tsTimeOrNull } from '../db/client';
-import { notifyBrowserAuthExpired } from '../notifications/triggers';
+import {
+  notifyBrowserAuthExpired,
+  notifyConnectionStoppedCollecting,
+} from '../notifications/triggers';
+import { emit } from '../events/emitter';
 import logger from '../utils/logger';
+import { nextRunAt as nextRunAtFromCron } from '../utils/cron';
 import { aclConnectionIdSql, isAclErrorMessage } from '../authz/acl-observability';
 import { deriveFeedHealthSemantics, feedWebhookDrivenSql } from './feed-health-semantics';
 import { connectorHasAutoSyncableFeedsSql } from './connection-health-semantics';
@@ -215,6 +221,28 @@ const DEGRADED_MIN_EXPECTED_FEEDS = 3;
  */
 const DEVICE_OFFLINE_HOURS = 48;
 
+/**
+ * How long past a scheduled feed's first missed run, with no run FINISHED
+ * since, before the feed counts as failing.
+ *
+ * This is the shape every rule above misses. A run that cannot reach its
+ * execution dependency (no browser bound, an extension too old, a signed-out
+ * site) records only `last_error` in `completeRun`: the worker claim already
+ * stamped `last_sync_status='pending'`, and the failure budget is deliberately
+ * untouched so the source is not blamed. Rule A needs `failed` or a failure
+ * count, Rule C needs a `success` row to date from, Rule E needs a feed that
+ * never finished — so a feed claimed every five minutes and failing every time
+ * read as healthy.
+ *
+ * Keyed on stored columns only: `last_sync_at` (written by both terminal
+ * paths and by neither the claim nor the dependency-unavailable branch) against
+ * the feed's own cron, and only while `last_error` says the latest attempt
+ * ended without finishing. A feed resumed after a clean pause carries an old
+ * `last_sync_at` but no error, so it is not a stall before its first run. Six hours tolerates a long backfill or a brief outage;
+ * a device that stopped polling is left to {@link DEVICE_OFFLINE_HOURS}.
+ */
+const STALL_GRACE_HOURS = 6;
+
 export interface ConnectorHealthConfig {
   failureThreshold: number;
   minConnectionAgeHours: number;
@@ -224,6 +252,7 @@ export interface ConnectorHealthConfig {
   degradedFailingRatio: number;
   degradedMinExpectedFeeds: number;
   deviceOfflineHours: number;
+  stallGraceHours: number;
 }
 
 export const DEFAULT_CONNECTOR_HEALTH_CONFIG: ConnectorHealthConfig = {
@@ -235,6 +264,7 @@ export const DEFAULT_CONNECTOR_HEALTH_CONFIG: ConnectorHealthConfig = {
   degradedFailingRatio: DEGRADED_FAILING_RATIO,
   degradedMinExpectedFeeds: DEGRADED_MIN_EXPECTED_FEEDS,
   deviceOfflineHours: DEVICE_OFFLINE_HOURS,
+  stallGraceHours: STALL_GRACE_HOURS,
 };
 
 export type UnhealthyReason =
@@ -267,6 +297,9 @@ export interface ConnectorHealthResult {
   /** Newly-unhealthy connections whose failure was an expired site session,
    * for which a user-facing "needs sign-in" notification was sent. */
   authNotified: number;
+  /** Newly-unhealthy connections that had been collecting, for which the
+   * org's admins were told it stopped. */
+  stoppedNotified: number;
   details: UnhealthyConnection[];
 }
 
@@ -276,6 +309,30 @@ interface HealthDeps {
   now?: () => number;
   /** Injectable for tests; defaults to the real browser-auth-expired trigger. */
   notifyAuthExpired?: typeof notifyBrowserAuthExpired;
+  /** Injectable for tests; defaults to the real stopped-collecting trigger. */
+  notifyStopped?: typeof notifyConnectionStoppedCollecting;
+}
+
+/**
+ * Reasons that mean a connection which WAS collecting has stopped, with the
+ * copy the org's admins receive. The setup-shaped reasons (`zero_feeds`,
+ * `never_collected`) are left out: an abandoned setup is not an outage, and
+ * telling an admin about it once per episode would be nagging, not news.
+ */
+function stoppedCollectingSummary(detail: UnhealthyConnection): string | null {
+  switch (detail.reason) {
+    case 'all_feeds_failing':
+      return 'Every feed on this connection is failing, so nothing new is being collected.';
+    case 'feeds_degraded':
+      return `${detail.failingFeedCount} of ${detail.feedCount} feeds on this connection keep failing.`;
+    case 'no_recent_sync':
+      return `No feed on this connection has synced successfully since ${detail.lastSyncAt ?? 'an unknown time'}.`;
+    case 'acl_failed':
+      return 'Lobu could not refresh who may see this connection\'s data, so access is fenced until it can.';
+    case 'zero_feeds':
+    case 'never_collected':
+      return null;
+  }
 }
 
 /**
@@ -303,6 +360,9 @@ interface FeedHealthRow {
   /** Device pinned but silent for longer than `cfg.deviceOfflineHours`, or its
    *  worker row is gone entirely. */
   device_stale: boolean | null;
+  device_pinned: boolean;
+  /** Pinned device worker's last poll; NULL when unpinned or never seen. */
+  device_last_seen_at: Date | string | null;
   feed_id: string | null;
   operations: Array<'sync' | 'read'> | null;
   /** Connector declares a webhook route for this feed key — the dispatch path
@@ -311,6 +371,7 @@ interface FeedHealthRow {
   store: 'events' | 'channel_messages' | null;
   feed_status: string | null;
   schedule: string | null;
+  timezone: string | null;
   last_sync_status: string | null;
   last_sync_at: Date | string | null;
   consecutive_failures: string;
@@ -363,12 +424,15 @@ async function loadConnectionHealthRows(
           OR dw.last_seen_at < now() - make_interval(hours => ${cfg.deviceOfflineHours})
         )
       ) AS device_stale,
+      c.device_worker_id IS NOT NULL AS device_pinned,
+      dw.last_seen_at AS device_last_seen_at,
       f.id AS feed_id,
       cd.feed_operations AS operations,
       cd.feed_webhook_driven AS webhook_driven,
       CASE WHEN f.config ->> 'store' = 'channel_messages' THEN 'channel_messages' ELSE 'events' END AS store,
       f.status AS feed_status,
       f.schedule,
+      f.timezone,
       f.last_sync_status,
       f.last_sync_at,
       f.consecutive_failures,
@@ -458,16 +522,71 @@ interface ClassifiedFeed {
    *  sign-in. Only these count toward the expected denominator and Rules A/C. */
   expected: boolean;
   /** Expected feed that is currently failing: last attempt failed, a failure
-   *  episode is underway, OR its pinned device has been silent past
-   *  `cfg.deviceOfflineHours`. */
+   *  episode is underway, its pinned device has been silent past
+   *  `cfg.deviceOfflineHours`, OR its schedule kept running with nothing
+   *  finishing for `cfg.stallGraceHours`. */
   failing: boolean;
-  /** Expected feed failing PERSISTENTLY (past the failure threshold) or on a
-   *  long-silent device — the only signal that feeds the degraded ratio, so one
+  /** Expected feed failing PERSISTENTLY (past the failure threshold, on a
+   *  long-silent device, or stalled) — the only signal that feeds the degraded ratio, so one
    *  transiently failing feed on a small connection stays quiet. */
   persistent: boolean;
+  /** Overdue expected feed whose outcome cannot be judged right now (a run
+   *  in flight, or its device asleep); it holds an open alert episode instead
+   *  of recovering it. */
+  holdsEpisode: boolean;
 }
 
-function classifyFeed(row: FeedHealthRow, cfg: ConnectorHealthConfig): ClassifiedFeed {
+/**
+ * Where this scheduled feed stands against `cfg.stallGraceHours` past its first
+ * missed run with nothing finished. See {@link STALL_GRACE_HOURS}.
+ *
+ * - `stalled` — overdue, and `last_error` says the latest attempt ended
+ *   without finishing.
+ * - `held` — overdue, but its outcome cannot be judged right now: a run is
+ *   claimed (the claim stamps `pending` and clears `last_error` on every
+ *   retry), or its pinned device is not polling (nothing can be claimed, and
+ *   whether that silence matters is the device-offline rule's decision). Such a
+ *   feed must neither raise an alert nor end one, or a retry or a laptop sleep
+ *   would recover the episode and the next failure alert again.
+ * - `null` — not overdue, or not this rule's to judge.
+ *
+ * A feed without a cron has no due time to measure from (most sync feeds are
+ * dispatched by other paths), and a feed that never finished is Rule E's. A
+ * feed resumed after a clean pause keeps its old `last_sync_at` but has no
+ * error and is not `pending` until claimed.
+ */
+function feedStallState(
+  row: FeedHealthRow,
+  cfg: ConnectorHealthConfig,
+  nowMs: number
+): 'stalled' | 'held' | null {
+  if (!row.schedule) return null;
+  const lastFinishedMs = tsTimeOrNull(row.last_sync_at);
+  if (lastFinishedMs === undefined) return null;
+  const graceMs = cfg.stallGraceHours * 60 * 60 * 1000;
+  let firstMissedMs: number;
+  try {
+    firstMissedMs = new Date(
+      nextRunAtFromCron(row.schedule, new Date(lastFinishedMs), row.timezone)
+    ).getTime();
+  } catch {
+    // An unparseable cron never dispatches; that is not this rule's outage.
+    return null;
+  }
+  if (nowMs - firstMissedMs <= graceMs) return null;
+  if (row.device_pinned) {
+    const seenMs = tsTimeOrNull(row.device_last_seen_at);
+    if (seenMs === undefined || nowMs - seenMs > graceMs) return 'held';
+  }
+  if (row.last_error) return 'stalled';
+  return row.last_sync_status === 'pending' ? 'held' : null;
+}
+
+function classifyFeed(
+  row: FeedHealthRow,
+  cfg: ConnectorHealthConfig,
+  nowMs: number
+): ClassifiedFeed {
   const cf = Number(row.consecutive_failures ?? 0);
   const semantics = deriveFeedHealthSemantics({
     operations: row.operations,
@@ -500,17 +619,24 @@ function classifyFeed(row: FeedHealthRow, cfg: ConnectorHealthConfig): Classifie
   // `DEVICE_OFFLINE_HOURS` for why this is not the semantics module's
   // dispatch-grade 120s `attention='device_offline'`.
   const deviceStale = row.device_stale === true;
+  const stallState = expected ? feedStallState(row, cfg, nowMs) : null;
+  const stalled = stallState === 'stalled';
 
   // Failing: a single most-recent-run failure counts (Rule A must stay
-  // sensitive to one bad run), past the persistent threshold, OR the pinned
-  // device went silent. Auto-paused feeds with cf > 0 are symptoms and count.
+  // sensitive to one bad run), past the persistent threshold, the pinned
+  // device went silent, OR the schedule stalled. Auto-paused feeds with cf > 0
+  // are symptoms and count.
   const failing =
     expected &&
-    (row.last_sync_status === 'failed' || cf >= cfg.failureThreshold || deviceStale);
+    (row.last_sync_status === 'failed' ||
+      cf >= cfg.failureThreshold ||
+      deviceStale ||
+      stalled);
 
-  const persistent = expected && (cf >= cfg.failureThreshold || deviceStale);
+  const persistent =
+    expected && (cf >= cfg.failureThreshold || deviceStale || stalled);
 
-  return { expected, failing, persistent };
+  return { expected, failing, persistent, holdsEpisode: stallState === 'held' };
 }
 
 /**
@@ -620,7 +746,7 @@ function classify(
   let expectedError: string | null = null;
 
   for (const row of feeds) {
-    const feed = classifyFeed(row, cfg);
+    const feed = classifyFeed(row, cfg, nowMs);
     if (!feed.expected) continue;
 
     expectedCount += 1;
@@ -709,6 +835,7 @@ export async function runConnectorHealthCheck(
   const cfg = deps.config ?? DEFAULT_CONNECTOR_HEALTH_CONFIG;
   const nowMs = (deps.now ?? (() => Date.now()))();
   const notifyAuthExpired = deps.notifyAuthExpired ?? notifyBrowserAuthExpired;
+  const notifyStopped = deps.notifyStopped ?? notifyConnectionStoppedCollecting;
 
   const rows = await loadConnectionHealthRows(sql, cfg);
 
@@ -718,6 +845,7 @@ export async function runConnectorHealthCheck(
     newlyAlerted: 0,
     recovered: 0,
     authNotified: 0,
+    stoppedNotified: 0,
     details: [],
   };
 
@@ -737,6 +865,12 @@ export async function runConnectorHealthCheck(
     const classified = classify(connectionRows, cfg, nowMs);
 
     if (!classified) {
+      // An overdue feed mid-retry or on a sleeping device has no verdict yet.
+      // Leave any open episode standing until a run actually finishes.
+      const holding = connectionRows.some(
+        (row) => row.feed_id != null && classifyFeed(row, cfg, nowMs).holdsEpisode
+      );
+      if (holding) continue;
       // Healthy: re-arm the alert if it was previously flagged. The conditional
       // WHERE makes this a no-op for connections that were already healthy, and
       // counts a real recovery exactly once across replicas.
@@ -770,21 +904,74 @@ export async function runConnectorHealthCheck(
     // Transition claim: only the replica whose UPDATE actually flips the marker
     // NULL→now() owns the alert. Concurrent ticks on other replicas get zero
     // rows back and stay silent — Postgres-mediated, no in-memory dedupe.
-    const claimed = (await sql`
-      UPDATE connections
-      SET unhealthy_alerted_at = now(), updated_at = now()
-      WHERE id = ${connectionId}
-        AND unhealthy_alerted_at IS NULL
-      RETURNING id
-    `) as unknown as Array<{ id: string }>;
+    //
+    // The admins' notification commits in the SAME transaction as the claim.
+    // The marker is what tells every later scan this episode was announced, so
+    // a marker committed beside a notice that failed to persist would silence
+    // the episode for good. On failure both roll back and the next tick
+    // retries; the scan itself moves on to the next connection.
+    const summary = stoppedCollectingSummary(detail);
+    const authExpired =
+      reason !== 'acl_failed' && isBrowserAuthExpiredError(detail.lastError);
+    let claimed: boolean;
+    try {
+      claimed = await sql.begin(async (tx) => {
+        const rows = (await tx`
+          UPDATE connections
+          SET unhealthy_alerted_at = now(), updated_at = now()
+          WHERE id = ${connectionId}
+            AND unhealthy_alerted_at IS NULL
+          RETURNING id
+        `) as unknown as Array<{ id: string }>;
+        if (rows.length === 0) return false; // already alerted on a prior tick
 
-    if (claimed.length === 0) continue; // already alerted on a prior tick
+        // An expired site session gets its specific "needs sign-in" notice; any
+        // other stop of a collecting connection gets the generic one.
+        if (authExpired) {
+          await notifyAuthExpired(
+            {
+              orgId: first.organization_id,
+              connectionId,
+              connectorKey: first.connector_key,
+            },
+            tx
+          );
+        } else if (summary) {
+          await notifyStopped(
+            {
+              orgId: first.organization_id,
+              connectionId,
+              connectorKey: first.connector_key,
+              displayName: first.display_name,
+              summary,
+              lastError: detail.lastError,
+            },
+            tx
+          );
+        }
+        return true;
+      });
+    } catch (err) {
+      logger.warn(
+        { err, connection_id: connectionId },
+        '[connector-health] failed to record unhealthy transition; retrying next tick'
+      );
+      continue;
+    }
+    if (!claimed) continue;
 
     result.newlyAlerted += 1;
+    if (authExpired) result.authNotified += 1;
+    else if (summary) result.stoppedNotified += 1;
+    if (authExpired || summary) {
+      emit(first.organization_id, {
+        keys: ['notifications', 'notifications-unread-count'],
+      });
+    }
 
-    // The alert. logger.error → pino→Sentry bridge → Sentry→Slack. A stable
-    // `msg` keeps Sentry grouping per reason; the structured fields carry the
-    // org/connector identifiers an operator needs to act.
+    // The operator alert, in the hosted logs. A stable `msg` keeps it
+    // groupable per reason; the structured fields carry the org/connector
+    // identifiers an operator needs to act.
     logger.error(
       {
         connection_id: connectionId,
@@ -799,27 +986,6 @@ export async function runConnectorHealthCheck(
       },
       `[connector-health] connector unhealthy (${reason}): ${first.connector_key}`
     );
-
-    // On the unhealthy transition, if the failure is an expired site session
-    // (not an offline device / transport error), also notify the org's admins
-    // to re-login — the operator alert above can't reach the person who has to
-    // sign in. Deduped by the same unhealthy_alerted_at claim, so it fires once
-    // per episode. Best-effort: a notification failure must not break the scan.
-    if (reason !== 'acl_failed' && isBrowserAuthExpiredError(detail.lastError)) {
-      try {
-        await notifyAuthExpired({
-          orgId: first.organization_id,
-          connectionId,
-          connectorKey: first.connector_key,
-        });
-        result.authNotified += 1;
-      } catch (err) {
-        logger.warn(
-          { err, connection_id: connectionId },
-          '[connector-health] failed to send browser-auth-expired notification'
-        );
-      }
-    }
   }
 
   return result;

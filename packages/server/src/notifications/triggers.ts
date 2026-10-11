@@ -577,7 +577,7 @@ export async function notifyBrowserAuthExpired(params: {
 	 * stored auth profile — those just need the user to re-login on the site.
 	 */
 	authProfileSlug?: string | null;
-}): Promise<void> {
+}, transaction?: DbClient): Promise<void> {
 	await notifyOrgAdmins(params.orgId, (orgSlug) => ({
 		type: "browser_auth_expired",
 		title: `${params.connectorKey} needs sign-in`,
@@ -599,7 +599,39 @@ export async function notifyBrowserAuthExpired(params: {
 			params.connectorKey,
 			params.connectionId,
 		),
-	}));
+	}), transaction);
+}
+
+/**
+ * A connection that was collecting has stopped. The connector-health scan owns
+ * the verdict and the once-per-episode claim; this only tells the org's admins,
+ * who are the people able to fix a binding, a device, or a token. `summary` is
+ * scan-authored copy; `lastError` comes from the connector and is escaped.
+ */
+export async function notifyConnectionStoppedCollecting(params: {
+	orgId: string;
+	connectionId: number;
+	connectorKey: string;
+	displayName: string | null;
+	summary: string;
+	lastError: string | null;
+}, transaction?: DbClient): Promise<void> {
+	const label = params.displayName?.trim() || params.connectorKey;
+	const body = params.lastError
+		? `${params.summary}\n\nLast error: ${escapeMarkdownText(params.lastError.slice(0, 500))}`
+		: params.summary;
+	await notifyOrgAdmins(params.orgId, (orgSlug) => ({
+		type: "generic",
+		title: `${label} needs attention`,
+		body,
+		resourceType: "connection",
+		resourceId: String(params.connectionId),
+		resourceUrl: connectionDetailUrl(
+			orgSlug,
+			params.connectorKey,
+			params.connectionId,
+		),
+	}), transaction);
 }
 
 export async function notifyInvitationReceived(params: {

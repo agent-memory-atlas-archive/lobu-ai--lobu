@@ -128,19 +128,21 @@ async function seedFeed(opts: {
   lastError?: string | null;
   deletedAt?: Date | null;
   pinnedVersion?: string | null;
+  schedule?: string | null;
 }): Promise<void> {
   const sql = getTestDb();
   await sql`
     INSERT INTO feeds (
       organization_id, connection_id, feed_key, status, config,
       last_sync_status, last_sync_at, consecutive_failures, last_error,
-      deleted_at, pinned_version, created_at, updated_at
+      deleted_at, pinned_version, schedule, created_at, updated_at
     ) VALUES (
       ${opts.orgId}, ${opts.connectionId}, ${opts.feedKey},
       ${opts.status ?? 'active'}, ${sql.json({ store: opts.store ?? 'events' })},
       ${opts.lastSyncStatus ?? null}, ${opts.lastSyncAt ?? null},
       ${opts.consecutiveFailures ?? 0}, ${opts.lastError ?? null},
-      ${opts.deletedAt ?? null}, ${opts.pinnedVersion ?? null}, NOW(), NOW()
+      ${opts.deletedAt ?? null}, ${opts.pinnedVersion ?? null},
+      ${opts.schedule ?? null}, NOW(), NOW()
     )
   `;
 }
@@ -1355,5 +1357,277 @@ describe('connector-health alerter', () => {
 
     const res = await runConnectorHealthCheck();
     expect(res.details.some((d) => d.connectionId === fresh.id)).toBe(false);
+  });
+
+  // A run that cannot reach its execution dependency (no browser bound, an
+  // extension too old, a signed-out site) records only `last_error`: the claim
+  // left `last_sync_status='pending'` and the failure budget is deliberately
+  // untouched. None of Rules A/C/E can see that row, so a scheduled feed sat
+  // in it for weeks while the scan reported healthy.
+  it('flags a scheduled feed that keeps being claimed but never finishes', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const stalled = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'stalled-dependency',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: stalled.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - 3 * day),
+      consecutiveFailures: 0,
+      lastError: 'Choose a paired Chrome browser for this connection before running it.',
+    });
+
+    const res = await runConnectorHealthCheck();
+    // Rule C cannot be what fires: the last finish is inside noSyncDays.
+    expect(3).toBeLessThan(cfg.noSyncDays);
+    expect(reasonFor(res.details, stalled.id)).toBe('all_feeds_failing');
+  });
+
+  // The device-pinned form of the same outage: the device keeps polling, so
+  // device liveness says healthy, yet every claimed run fails before it starts.
+  it('flags a stalled feed whose pinned device is still polling', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const liveDevice = await seedDeviceWorker({
+      orgId,
+      userId,
+      workerId: 'worker-alive-stalled',
+      lastSeenAt: new Date(Date.now() - 60 * 1000),
+    });
+    const stalled = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'stalled-on-live-device',
+      createdAt: OLD,
+      deviceWorkerId: liveDevice,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: stalled.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - day),
+      consecutiveFailures: 0,
+      lastError: 'Sign in to the provider in the selected browser, then verify this connection again.',
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(reasonFor(res.details, stalled.id)).toBe('all_feeds_failing');
+  });
+
+  // A closed laptop stops claims too. That is the device-offline rule's call
+  // (`deviceOfflineHours`), so an overnight sleep must not read as a stall.
+  it('does not call a sleeping device a stalled feed', async () => {
+    const hour = 60 * 60 * 1000;
+    const sleepingDevice = await seedDeviceWorker({
+      orgId,
+      userId,
+      workerId: 'worker-asleep',
+      lastSeenAt: new Date(Date.now() - 10 * hour),
+    });
+    const asleep = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'device-asleep-overnight',
+      createdAt: OLD,
+      deviceWorkerId: sleepingDevice,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: asleep.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - 10 * hour),
+      consecutiveFailures: 0,
+      lastError: 'The selected browser is offline.',
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(10).toBeGreaterThan(cfg.stallGraceHours);
+    expect(10).toBeLessThan(cfg.deviceOfflineHours);
+    expect(res.details.some((d) => d.connectionId === asleep.id)).toBe(false);
+  });
+
+  it('gives a scheduled feed the stall grace before flagging it', async () => {
+    const hour = 60 * 60 * 1000;
+    const recent = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'stall-within-grace',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: recent.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - hour),
+      consecutiveFailures: 0,
+      lastError: 'Choose a paired Chrome browser for this connection before running it.',
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(1).toBeLessThan(cfg.stallGraceHours);
+    expect(res.details.some((d) => d.connectionId === recent.id)).toBe(false);
+  });
+
+  // Resuming a cleanly paused feed leaves its old `last_sync_at` in place until
+  // the first run finishes. With no error recorded, that is a feed waiting for
+  // its next run, not a stall.
+  it('does not call a feed resumed after a clean pause stalled', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const resumed = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'resumed-after-pause',
+      createdAt: OLD,
+    });
+    await seedFeed({
+      orgId,
+      connectionId: resumed.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'success',
+      lastSyncAt: new Date(Date.now() - 3 * day),
+      consecutiveFailures: 0,
+      lastError: null,
+    });
+
+    const res = await runConnectorHealthCheck();
+    expect(res.details.some((d) => d.connectionId === resumed.id)).toBe(false);
+  });
+
+  // The worker claim stamps `pending` and clears `last_error` on every retry,
+  // so a scan landing mid-run cannot tell a stalled feed from a recovered one.
+  // It must hold the episode, or the next failed attempt alerts again for the
+  // same outage.
+  it('holds a stalled episode across a retry claim instead of recovering it', async () => {
+    const sql = getTestDb();
+    const day = 24 * 60 * 60 * 1000;
+    const flapping = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'stalled-across-retries',
+      createdAt: OLD,
+    });
+    const dependencyError = 'Choose a paired Chrome browser for this connection before running it.';
+    await seedFeed({
+      orgId,
+      connectionId: flapping.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - 2 * day),
+      consecutiveFailures: 0,
+      lastError: dependencyError,
+    });
+    const marker = async () =>
+      ((await sql`
+        SELECT unhealthy_alerted_at FROM connections WHERE id = ${flapping.id}
+      `) as unknown as Array<{ unhealthy_alerted_at: Date | null }>)[0]
+        .unhealthy_alerted_at;
+
+    expect(reasonFor((await runConnectorHealthCheck()).details, flapping.id)).toBe(
+      'all_feeds_failing',
+    );
+    const alertedAt = await marker();
+    expect(alertedAt).not.toBeNull();
+
+    // A retry is claimed (poll.ts marked_feed): pending, error cleared.
+    await sql`
+      UPDATE feeds SET last_sync_status = 'pending', last_error = NULL
+      WHERE connection_id = ${flapping.id}
+    `;
+    await runConnectorHealthCheck();
+    expect(await marker()).toEqual(alertedAt);
+
+    // The retry fails on the same dependency: still one episode, no new alert.
+    await sql`
+      UPDATE feeds SET last_error = ${dependencyError}
+      WHERE connection_id = ${flapping.id}
+    `;
+    await runConnectorHealthCheck();
+    expect(await marker()).toEqual(alertedAt);
+
+    // A sync that actually finishes ends the episode.
+    await sql`
+      UPDATE feeds
+      SET last_sync_status = 'success', last_sync_at = NOW(), last_error = NULL
+      WHERE connection_id = ${flapping.id}
+    `;
+    await runConnectorHealthCheck();
+    expect(await marker()).toBeNull();
+  });
+
+  // A laptop that sleeps through a stalled episode suspends judgment; it is not
+  // a recovery. Reconnecting into the same failure must not alert twice.
+  it('holds a stalled episode while its pinned device sleeps', async () => {
+    const sql = getTestDb();
+    const day = 24 * 60 * 60 * 1000;
+    const hour = 60 * 60 * 1000;
+    const device = await seedDeviceWorker({
+      orgId,
+      userId,
+      workerId: 'worker-sleeps-mid-stall',
+      lastSeenAt: new Date(Date.now() - 60 * 1000),
+    });
+    const conn = await seedConnection({
+      orgId,
+      userId,
+      connectorKey: 'spotify',
+      slug: 'stalled-then-asleep',
+      createdAt: OLD,
+      deviceWorkerId: device,
+    });
+    const dependencyError = 'Choose a paired Chrome browser for this connection before running it.';
+    await seedFeed({
+      orgId,
+      connectionId: conn.id,
+      feedKey: 'a',
+      schedule: '*/5 * * * *',
+      lastSyncStatus: 'pending',
+      lastSyncAt: new Date(Date.now() - 2 * day),
+      consecutiveFailures: 0,
+      lastError: dependencyError,
+    });
+    const marker = async () =>
+      ((await sql`
+        SELECT unhealthy_alerted_at FROM connections WHERE id = ${conn.id}
+      `) as unknown as Array<{ unhealthy_alerted_at: Date | null }>)[0]
+        .unhealthy_alerted_at;
+
+    expect(reasonFor((await runConnectorHealthCheck()).details, conn.id)).toBe(
+      'all_feeds_failing',
+    );
+    const alertedAt = await marker();
+    expect(alertedAt).not.toBeNull();
+
+    // The laptop sleeps for 10 hours: past the stall grace, short of offline.
+    await sql`
+      UPDATE device_workers SET last_seen_at = ${new Date(Date.now() - 10 * hour)}
+      WHERE id = ${device}
+    `;
+    await runConnectorHealthCheck();
+    expect(await marker()).toEqual(alertedAt);
+
+    // It wakes into the same dependency failure: still the same episode.
+    await sql`UPDATE device_workers SET last_seen_at = NOW() WHERE id = ${device}`;
+    const woke = await runConnectorHealthCheck();
+    expect(woke.newlyAlerted).toBe(0);
+    expect(await marker()).toEqual(alertedAt);
   });
 });
