@@ -6,6 +6,7 @@ import path from "node:path";
 import { JSDOM } from "jsdom";
 import { connectorSdkMock } from "./connector-sdk.mock";
 import { constrainBrowserInput } from "@lobu/connector-sdk/browser-requirement";
+import { getSelectableMethods } from "../../../packages/owletto/src/components/entity-tabs/connections-tab/auth-helpers";
 
 // Stub @lobu/connector-sdk (it pulls in playwright) so the connector imports
 // without the browser stack. Shared superset — see connector-sdk.mock.ts.
@@ -3034,18 +3035,44 @@ describe("LinkedInConnector takeout identity attributions", () => {
 });
 
 describe("LinkedInConnector auth schema", () => {
-  test("requires a live browser account without an OAuth handshake", () => {
+  test("keeps browser and local export authentication independent of sign-in", () => {
     const def = new LinkedInConnector().definition;
     const methods = def.authSchema.methods;
-    expect(methods).toHaveLength(2);
+    expect(methods.map((method: { type: string }) => method.type)).toEqual([
+      "browser",
+      "none",
+      "oauth",
+    ]);
     expect(methods[0]).toMatchObject({ type: "browser", mode: "live" });
-    expect(methods[1]).toMatchObject({ type: "none" });
-    // No oauth method — the server would otherwise pick it as authoritative and
-    // force a LinkedIn OAuth flow before a connection could be created, blocking
-    // the takeout + extension use cases (no feed consumes an OAuth token).
-    expect(methods.some((m: { type: string }) => m.type === "oauth")).toBe(
-      false
+    expect(def.browser.authMethods).toEqual(["browser"]);
+    for (const configuredKeys of [
+      undefined,
+      new Set<string>(),
+      new Set(["LINKEDIN_CLIENT_ID", "LINKEDIN_CLIENT_SECRET"]),
+    ]) {
+      expect(
+        getSelectableMethods(def.authSchema, configuredKeys).map(
+          (method) => method.type
+        )
+      ).toEqual(["browser", "none"]);
+    }
+  });
+
+  test("offers identity-only OAuth sign-in without provisioning source connections", () => {
+    const def = new LinkedInConnector().definition;
+    const oauth = def.authSchema.methods.find(
+      (method: { type: string }) => method.type === "oauth"
     );
+    expect(oauth).toMatchObject({
+      provider: "linkedin",
+      requiredScopes: [],
+      loginScopes: ["openid", "profile", "email"],
+      authorizationUrl: "https://www.linkedin.com/oauth/v2/authorization",
+      tokenUrl: "https://www.linkedin.com/oauth/v2/accessToken",
+      userinfoUrl: "https://api.linkedin.com/v2/userinfo",
+      tokenEndpointAuthMethod: "client_secret_post",
+      loginProvisioning: { autoCreateConnection: false },
+    });
   });
 });
 
@@ -3408,7 +3435,7 @@ describe("prepare_comment helpers", () => {
     expect(action?.inputSchema?.properties).not.toHaveProperty(
       "browser_connection_id"
     );
-    expect(c.definition.version).toBe("3.14.0");
+    expect(c.definition.version).toBe("3.15.0");
     expect(String(action?.description ?? "")).toMatch(
       /NEVER opens a tab or submits/i
     );
