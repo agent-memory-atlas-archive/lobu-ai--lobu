@@ -20,7 +20,13 @@ import { findExistingPersonalOrg } from './personal-org-provisioning';
 import { hostOnlyExpiry } from './session-cookie-scope';
 import { OAuthClientsStore } from './oauth/clients';
 import { OAuthProvider } from './oauth/provider';
-import { AVAILABLE_PAT_SCOPES, DEFAULT_SCOPES_STRING, POLICY_WRITE_SCOPE } from './oauth/scopes';
+import type { AuthInfo } from './oauth/types';
+import {
+  AVAILABLE_PAT_SCOPES,
+  canMintWebSession,
+  DEFAULT_SCOPES_STRING,
+  POLICY_WRITE_SCOPE,
+} from './oauth/scopes';
 import { PersonalAccessTokenService } from './tokens';
 
 const credentialRoutes = new Hono<{ Bindings: Env }>();
@@ -367,6 +373,39 @@ async function mintSessionCookieValue(
 }
 
 /**
+ * Chrome extensions before 0.9.4 sign the side panel in with a credential that
+ * lacks mcp:admin: the device-only child PAT from a desktop-app pairing, or the
+ * read-only device-code grant the extension used to request. Store updates take
+ * days to reach every browser, so /extension-session keeps accepting exactly
+ * those two shapes until active Chrome workers report 0.9.4 or later
+ * (`device_workers.app_version`); then delete this.
+ */
+async function isPre094ChromePanelCredential(
+  sql: ReturnType<typeof createDbClientFromEnv>,
+  authInfo: AuthInfo
+): Promise<boolean> {
+  if (!authInfo.scopes.includes('device_worker:run') || authInfo.resource) return false;
+  if (authInfo.tokenType === 'pat') {
+    if (!authInfo.workerId) return false;
+    const rows = await sql`
+      SELECT 1 FROM device_workers
+      WHERE user_id = ${authInfo.userId}
+        AND worker_id = ${authInfo.workerId}
+        AND platform = 'chrome-extension'
+      LIMIT 1
+    `;
+    return rows.length > 0;
+  }
+  if (authInfo.authorizationGrantType !== 'device_code') return false;
+  const rows = await sql`
+    SELECT 1 FROM oauth_clients
+    WHERE id = ${authInfo.clientId} AND software_id = 'owletto-chrome'
+    LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+/**
  * Resolve a `?token=…` deep-link credential to its user and organization.
  * Accepts all three credential shapes the deep-link callers hold:
  *   - Personal Access Tokens (`owl_pat_*`, `personal_access_tokens`)
@@ -381,12 +420,18 @@ async function mintSessionCookieValue(
  */
 async function resolveDeepLinkToken(
   c: Context<{ Bindings: Env }>,
-  token: string
-): Promise<{ userId: string; organizationId: string | null } | null> {
+  token: string,
+  options: { acceptPre094ChromePanel?: boolean } = {}
+): Promise<{ userId: string; organizationId: string | null } | 'insufficient_scope' | null> {
   const sql = createDbClientFromEnv(c.env);
   const baseUrl = resolveBaseUrl({ request: c.req.raw });
   const authInfo = await new OAuthProvider(sql, baseUrl).verifyAccessToken(token);
   if (authInfo?.userId) {
+    const allowed =
+      canMintWebSession(authInfo) ||
+      (options.acceptPre094ChromePanel === true &&
+        (await isPre094ChromePanelCredential(sql, authInfo)));
+    if (!allowed) return 'insufficient_scope';
     return {
       userId: authInfo.userId,
       organizationId: authInfo.organizationId,
@@ -433,7 +478,15 @@ async function handleExchangeToken(
     );
   }
 
+  const next = rawNext ?? '/';
+  const safeNext = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+
   const identity = await resolveDeepLinkToken(c, trimmed);
+  if (identity === 'insufficient_scope') {
+    // Not an error for the person clicking the link: send them through the
+    // normal sign-in and on to where they were going.
+    return c.redirect(`/auth/login?callbackUrl=${encodeURIComponent(safeNext)}`, 302);
+  }
   if (!identity) {
     return c.json(
       { error: 'invalid_token', error_description: 'token is invalid, expired, or revoked' },
@@ -453,8 +506,6 @@ async function handleExchangeToken(
     c.header('Set-Cookie', minted.hostOnlyExpiryHeader, { append: true });
   }
 
-  const next = rawNext ?? '/';
-  const safeNext = next.startsWith('/') && !next.startsWith('//') ? next : '/';
   return c.redirect(safeNext, 302);
 }
 
@@ -487,7 +538,16 @@ credentialRoutes.post('/extension-session', async (c) => {
     );
   }
 
-  const identity = await resolveDeepLinkToken(c, token);
+  const identity = await resolveDeepLinkToken(c, token, { acceptPre094ChromePanel: true });
+  if (identity === 'insufficient_scope') {
+    return c.json(
+      {
+        error: 'insufficient_scope',
+        error_description: 'a web session requires a PAT or device-code sign-in with mcp:admin',
+      },
+      403
+    );
+  }
   if (!identity) {
     return c.json(
       { error: 'invalid_token', error_description: 'token is invalid, expired, or revoked' },
@@ -539,6 +599,15 @@ credentialRoutes.get('/sse-ticket', async (c) => {
   }
 
   const identity = await resolveDeepLinkToken(c, bearer);
+  if (identity === 'insufficient_scope') {
+    return c.json(
+      {
+        error: 'insufficient_scope',
+        error_description: 'a web session requires a PAT or device-code sign-in with mcp:admin',
+      },
+      403
+    );
+  }
   if (!identity) {
     return c.json(
       { error: 'invalid_token', error_description: 'token is invalid, expired, or revoked' },
@@ -611,7 +680,7 @@ credentialRoutes.get('/extension-bootstrap', (c) => {
   if (!token) { location.replace("/"); return; }
   var retried = false;
   var activeAttempt = null;
-  function fail(msg) {
+  function fail(msg, repair) {
     // Surface a real error instead of redirecting to a token-less app, which
     // would just render signed-out and hang on a spinner — the exact failure
     // this whole flow exists to avoid. Retry re-submits the SAME deep-link
@@ -623,13 +692,16 @@ credentialRoutes.get('/extension-bootstrap', (c) => {
       '<p style="margin:0 0 .5rem;font-weight:600">Could not connect to Lobu.</p>' +
       '<p style="margin:0 0 1rem;color:#a8a29e"></p>' +
       '<button id="owl-retry" style="font:inherit;padding:.4rem .9rem;border:1px solid #3f3f46;border-radius:.4rem;background:#18181b;color:inherit;cursor:pointer">Retry</button>' +
-      (retried
-        ? '<button id="owl-settings" style="font:inherit;margin-left:.5rem;padding:.4rem .9rem;border:1px solid #3f3f46;border-radius:.4rem;background:#18181b;color:inherit;cursor:pointer">Change server</button>'
+      (retried || repair
+        ? '<button id="owl-settings" style="font:inherit;margin-left:.5rem;padding:.4rem .9rem;border:1px solid #3f3f46;border-radius:.4rem;background:#18181b;color:inherit;cursor:pointer">' + (repair ? 'Re-pair' : 'Change server') + '</button>'
         : '') +
       '</div>';
     document.querySelectorAll("p")[1].textContent = msg;
     var b = document.getElementById("owl-retry");
-    if (b) b.onclick = function () { retried = true; attempt(); };
+    // Retrying a token that lacks the scope can never succeed; only re-pairing
+    // (which requests mcp:admin) can, so lead with that.
+    if (b && repair) b.remove();
+    else if (b) b.onclick = function () { retried = true; attempt(); };
     // The bootstrap page is a cross-origin iframe inside the extension side
     // panel and can't open Settings itself — ask the panel parent to switch to
     // its Settings view (origin-checked on the receiving end).
@@ -660,10 +732,23 @@ credentialRoutes.get('/extension-bootstrap', (c) => {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: body.toString(),
     })
-      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (r) {
+        if (r.ok) return r.json();
+        if (r.status === 401 || r.status === 403) {
+          return r.json().catch(function () { return null; });
+        }
+        return null;
+      })
       .then(function (data) {
         if (activeAttempt !== current) return;
-        if (data && data.session_token) {
+        if (data && (data.error === "insufficient_scope" || data.error === "invalid_token")) {
+          // A panel paired through the desktop app can fetch a fresh sign-in
+          // credential on its own; tell it so before falling back to the UI.
+          try { window.parent.postMessage({ owletto: "session-rejected" }, "*"); } catch (e) {}
+        }
+        if (data && data.error === "insufficient_scope") {
+          fail("This extension was paired with read-only access, which can't open the app. Re-pair to sign in.", true);
+        } else if (data && data.session_token) {
           try { sessionStorage.setItem("owletto.session_token", data.session_token); } catch (e) {}
           location.replace(next);
         } else {

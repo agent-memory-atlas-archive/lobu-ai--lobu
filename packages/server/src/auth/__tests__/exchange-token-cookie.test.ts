@@ -1,6 +1,7 @@
+import { runInNewContext } from 'node:vm';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { cleanupTestDatabase } from '../../__tests__/setup/test-db';
+import { cleanupTestDatabase, getTestDb } from '../../__tests__/setup/test-db';
 import {
   addUserToOrganization,
   createTestAccessToken,
@@ -11,6 +12,7 @@ import {
 } from '../../__tests__/setup/test-fixtures';
 import { get, postForm } from '../../__tests__/setup/test-helpers';
 import { clearAuthCacheForTests } from '../index';
+import { PersonalAccessTokenService } from '../tokens';
 import {
   verifySettingsSessionOrToken,
   verifySettingsToken,
@@ -31,12 +33,13 @@ describe('deep-link token exchange', () => {
 
   async function patForNewUser(
     slug: string,
-    email: string
+    email: string,
+    scope = 'mcp:admin profile:read'
   ): Promise<{ token: string; orgId: string }> {
     const org = await createTestOrganization({ slug });
     const user = await createTestUser({ email });
     await addUserToOrganization(user.id, org.id, 'owner');
-    const { token } = await createTestPAT(user.id, org.id, { scope: 'profile:read' });
+    const { token } = await createTestPAT(user.id, org.id, { scope });
     return { token, orgId: org.id };
   }
 
@@ -80,8 +83,9 @@ describe('deep-link token exchange', () => {
     const user = await createTestUser({ email: 'xt-oauth@test.example.com' });
     await addUserToOrganization(user.id, org.id, 'owner');
     const client = await createTestOAuthClient();
+    // A private scope makes the fixture mint this as a device_code grant.
     const { token } = await createTestAccessToken(user.id, org.id, client.client_id, {
-      scope: 'profile:read',
+      scope: 'mcp:admin device_worker:run profile:read',
     });
     expect(token.startsWith('owl_pat_')).toBe(false); // genuinely an OAuth access token
 
@@ -93,6 +97,64 @@ describe('deep-link token exchange', () => {
     expect(await activeOrgOf(sessionToken)).toBe(org.id);
   });
 
+  async function oauthTokenForNewUser(
+    slug: string,
+    scope: string,
+    grantType: 'authorization_code' | 'device_code' | null
+  ): Promise<string> {
+    const org = await createTestOrganization({ slug });
+    const user = await createTestUser({ email: `${slug}@test.example.com` });
+    await addUserToOrganization(user.id, org.id, 'owner');
+    const client = await createTestOAuthClient();
+    const { token } = await createTestAccessToken(user.id, org.id, client.client_id, { scope });
+    // The shared fixture infers provenance from private scopes; set it
+    // explicitly to exercise both current and legacy public-scope grants.
+    const sql = getTestDb();
+    await sql`
+      UPDATE oauth_tokens SET authorization_grant_type = ${grantType}
+      WHERE user_id = ${user.id} AND client_id = ${client.client_id}
+    `;
+    return token;
+  }
+
+  it.each([
+    [
+      'a PAT without mcp:admin',
+      () => patForNewUser('xt-pat-ro', 'xt-pat-ro@test.example.com', 'mcp:read profile:read')
+        .then((p) => p.token),
+    ],
+    [
+      'a read-only device-code sign-in',
+      () => oauthTokenForNewUser('xt-dev-ro', 'mcp:read device_worker:run profile:read', 'device_code'),
+    ],
+    [
+      'an authorization-code token with mcp:admin',
+      () => oauthTokenForNewUser('xt-auth-admin', 'mcp:read mcp:write mcp:admin profile:read', 'authorization_code'),
+    ],
+    [
+      'a legacy OAuth token with mcp:admin',
+      () => oauthTokenForNewUser('xt-legacy-admin', 'mcp:read mcp:write mcp:admin profile:read', null),
+    ],
+  ])('refuses to turn %s into a web session', async (_label, mint) => {
+    const token = await mint();
+
+    const extension = await postForm('/api/extension-session', { token });
+    expect(extension.status).toBe(403);
+    expect(((await extension.json()) as { error?: string }).error).toBe('insufficient_scope');
+
+    const ticket = await get('/api/sse-ticket', { token });
+    expect(ticket.status).toBe(403);
+    expect(((await ticket.json()) as { error?: string }).error).toBe('insufficient_scope');
+
+    // The browser deep link falls back to the normal sign-in, keeping `next`.
+    const exchanged = await get(
+      `/api/exchange-token?token=${encodeURIComponent(token)}&next=${encodeURIComponent('/acme/agents')}`
+    );
+    expect(exchanged.status).toBe(302);
+    expect(exchanged.headers.get('location')).toBe('/auth/login?callbackUrl=%2Facme%2Fagents');
+    expect(exchanged.headers.get('set-cookie')).toBeNull();
+  });
+
   it('GET /exchange-token keeps a first-party Lax cookie — never Partitioned/None (CLI/menu-bar)', async () => {
     const { token } = await patForNewUser('xt-get-org', 'xt-get@test.example.com');
     const res = await get(`/api/exchange-token?token=${encodeURIComponent(token)}&next=/`);
@@ -102,6 +164,63 @@ describe('deep-link token exchange', () => {
     expect(cookie).toMatch(/SameSite=Lax/i);
     expect(cookie).not.toMatch(/Partitioned/i);
     expect(cookie).not.toMatch(/SameSite=None/i);
+  });
+
+  // Store updates take days to reach every browser, so the side panel of an
+  // extension older than 0.9.4 keeps signing in with the credential it holds,
+  // but only on /extension-session and only for those two Chrome shapes.
+  async function chromeChildPat(slug: string, platform: string): Promise<string> {
+    const org = await createTestOrganization({ slug });
+    const user = await createTestUser({ email: `${slug}@test.example.com` });
+    await addUserToOrganization(user.id, org.id, 'owner');
+    const workerId = `${platform}:${slug}`;
+    const sql = getTestDb();
+    await sql`
+      INSERT INTO device_workers (user_id, worker_id, platform, capabilities, organization_id)
+      VALUES (${user.id}, ${workerId}, ${platform}, '[]'::jsonb, ${org.id})
+    `;
+    const minted = await new PersonalAccessTokenService(sql).create(user.id, org.id, `device:${platform}:x`, {
+      scope: 'device_worker:run',
+      workerId,
+    });
+    return minted.token;
+  }
+
+  async function chromeOAuthPairing(slug: string, softwareId: string): Promise<string> {
+    const org = await createTestOrganization({ slug });
+    const user = await createTestUser({ email: `${slug}@test.example.com` });
+    await addUserToOrganization(user.id, org.id, 'owner');
+    const client = await createTestOAuthClient({ software_id: softwareId });
+    // A private scope makes the fixture mint this as a device_code grant.
+    const { token } = await createTestAccessToken(user.id, org.id, client.client_id, {
+      scope: 'device_worker:run profile:read mcp:read',
+    });
+    return token;
+  }
+
+  it.each([
+    ['a desktop-paired Chrome child PAT', () => chromeChildPat('xt-old-chrome-child', 'chrome-extension')],
+    ['a read-only Chrome OAuth pairing', () => chromeOAuthPairing('xt-old-chrome-oauth', 'owletto-chrome')],
+  ])('keeps a pre-0.9.4 side panel signed in with %s, on /extension-session only', async (_label, mint) => {
+    const token = await mint();
+
+    const session = await postForm('/api/extension-session', { token });
+    expect(session.status).toBe(200);
+    expect(((await session.json()) as { session_token?: string }).session_token).toBeTruthy();
+
+    const exchange = await get(`/api/exchange-token?token=${encodeURIComponent(token)}&next=%2F`);
+    expect(exchange.status).toBe(302);
+    expect(exchange.headers.get('location')).toMatch(/^\/auth\/login\?/);
+    expect(exchange.headers.get('set-cookie')).toBeNull();
+  });
+
+  it.each([
+    ['a headless child PAT', () => chromeChildPat('xt-headless-child', 'headless')],
+    ['a read-only device grant from another client', () => chromeOAuthPairing('xt-other-oauth', 'some-other-app')],
+  ])('still refuses %s on /extension-session', async (_label, mint) => {
+    const res = await postForm('/api/extension-session', { token: await mint() });
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error?: string }).error).toBe('insufficient_scope');
   });
 
   it.each(['development', 'production'])('minted cookie authenticates under %s Node settings on loopback HTTP', async (nodeEnv) => {
@@ -194,7 +313,7 @@ describe('deep-link token exchange', () => {
     const org = await createTestOrganization({ slug });
     const user = await createTestUser({ email: 'xt-bearer@test.example.com' });
     await addUserToOrganization(user.id, org.id, 'owner');
-    const { token: pat } = await createTestPAT(user.id, org.id, { scope: 'profile:read' });
+    const { token: pat } = await createTestPAT(user.id, org.id, { scope: 'mcp:admin profile:read' });
 
     // Exchange the extension's deep-link token for a session token.
     const exchange = await postForm('/api/extension-session', { token: pat });
@@ -236,7 +355,7 @@ describe('SSE ticket (/api/sse-ticket)', () => {
     const org = await createTestOrganization({ slug });
     const user = await createTestUser({ email });
     await addUserToOrganization(user.id, org.id, 'owner');
-    const { token: pat } = await createTestPAT(user.id, org.id, { scope: 'profile:read' });
+    const { token: pat } = await createTestPAT(user.id, org.id, { scope: 'mcp:admin profile:read' });
     const exchange = await postForm('/api/extension-session', { token: pat });
     return ((await exchange.json()) as { session_token: string }).session_token;
   }
@@ -305,5 +424,77 @@ describe('SSE ticket (/api/sse-ticket)', () => {
     // to a token-less app (which would just hang on a spinner).
     expect(html).toContain('owl-retry');
     expect(html).toContain('function fail');
+  });
+
+  // A read-only pairing can never mint a session, so the page must lead with
+  // re-pairing (which asks for mcp:admin) instead of a Retry that loops forever.
+  it('bootstrap offers re-pairing when the paired token lacks mcp:admin', async () => {
+    const org = await createTestOrganization({ slug: 'xt-boot-ro' });
+    const user = await createTestUser({ email: 'xt-boot-ro@test.example.com' });
+    await addUserToOrganization(user.id, org.id, 'owner');
+    const client = await createTestOAuthClient();
+    // A private scope makes the fixture mint this as a device_code grant,
+    // the shape a pre-mcp:admin Chrome pairing holds.
+    const { token } = await createTestAccessToken(user.id, org.id, client.client_id, {
+      scope: 'mcp:read device_worker:run profile:read',
+    });
+    const html = await (await get('/api/extension-bootstrap')).text();
+    const script = html.slice(html.indexOf('<script>') + '<script>'.length, html.lastIndexOf('</script>'));
+
+    const body = { innerHTML: '', textContent: '' };
+    const message = { textContent: '' };
+    const buttons = new Map<string, { removed?: boolean; onclick?: () => void; remove?: () => void }>();
+    const posted: unknown[] = [];
+    let settled!: () => void;
+    const rendered = new Promise<void>((resolve) => {
+      settled = resolve;
+    });
+    const document = {
+      body: new Proxy(body, {
+        set(target, key, value) {
+          (target as Record<string | symbol, unknown>)[key] = value;
+          if (key === 'innerHTML') {
+            buttons.clear();
+            for (const id of ['owl-retry', 'owl-settings']) {
+              if (!String(value).includes(`id="${id}"`)) continue;
+              const button: { removed?: boolean; remove?: () => void } = {};
+              button.remove = () => {
+                button.removed = true;
+              };
+              buttons.set(id, button);
+            }
+            settled();
+          }
+          return true;
+        },
+      }),
+      querySelectorAll: () => [{}, message],
+      getElementById: (id: string) => buttons.get(id) ?? null,
+    };
+    runInNewContext(script, {
+      URLSearchParams,
+      AbortController,
+      setTimeout,
+      clearTimeout,
+      document,
+      location: { hash: `#token=${encodeURIComponent(token)}`, pathname: '/api/extension-bootstrap', replace() {} },
+      history: { replaceState() {} },
+      sessionStorage: { setItem() {} },
+      window: { parent: { postMessage: (data: unknown) => posted.push(data) } },
+      fetch: async (path: string, init: { body: string }) => {
+        const res = await postForm(path, Object.fromEntries(new URLSearchParams(init.body)));
+        return { ok: res.status >= 200 && res.status < 300, status: res.status, json: res.json };
+      },
+    });
+    await rendered;
+
+    expect(message.textContent).toContain('Re-pair to sign in');
+    expect(body.innerHTML).toContain('>Re-pair</button>');
+    expect(buttons.get('owl-retry')?.removed).toBe(true);
+    // The panel hears about the rejection first, so a desktop-paired panel can
+    // fetch a fresh credential without the user doing anything.
+    expect(posted).toEqual([{ owletto: 'session-rejected' }]);
+    buttons.get('owl-settings')?.onclick?.();
+    expect(posted).toEqual([{ owletto: 'session-rejected' }, { owletto: 'open-settings' }]);
   });
 });
