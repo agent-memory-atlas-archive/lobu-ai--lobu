@@ -1846,7 +1846,7 @@ describe("LinkedInConnector home_feed", () => {
     expect(calls[0].input.persistent).toBe(false);
     expect(calls[0].input.existing_tab_match).toBeUndefined();
     expect(calls[0].input.focus).toBe(false);
-    expect(calls[0].input.url).toBe("https://www.linkedin.com/feed/");
+    expect(calls[0].input.url).toBe("https://www.linkedin.com/feed/foryou/");
     expect(
       (calls[0].input.scrape_config as { scroll: { max: number } }).scroll.max
     ).toBe(4);
@@ -3026,6 +3026,29 @@ describe("LinkedInConnector takeout identity attributions", () => {
   });
 });
 
+describe("LinkedInConnector automation events", () => {
+  test("declares every feed kind and source reference type", () => {
+    const def = new LinkedInConnector().definition;
+    const declared = def.automationEvents.map(
+      (event: { key: string }) => event.key
+    );
+    // Source deliveries require declared keys; the declaration also replaces
+    // the eventKinds-derived trigger catalog, so it must cover every feed kind.
+    for (const feed of Object.values(def.feeds) as Array<{
+      eventKinds?: Record<string, unknown>;
+      webhook?: { events: string[] };
+    }>) {
+      for (const kind of Object.keys(feed.eventKinds ?? {}))
+        expect(declared).toContain(kind);
+      for (const event of feed.webhook?.events ?? []) {
+        expect(declared).toContain(event);
+        expect(Object.keys(feed.eventKinds ?? {})).toContain(event);
+      }
+    }
+    expect(def.feeds.live_messages.webhook.events).toContain("source.gap");
+  });
+});
+
 describe("LinkedInConnector auth schema", () => {
   test("keeps browser and local export authentication independent of sign-in", () => {
     const def = new LinkedInConnector().definition;
@@ -3397,7 +3420,7 @@ describe("prepare_comment helpers", () => {
     expect(action?.inputSchema?.properties).not.toHaveProperty(
       "browser_connection_id"
     );
-    expect(c.definition.version).toBe("3.17.0");
+    expect(c.definition.version).toBe("3.18.6");
     expect(String(action?.description ?? "")).toMatch(
       /NEVER opens a tab or submits/i
     );
