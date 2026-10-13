@@ -20,6 +20,7 @@ import {
   loadContextConfig,
   removeContext,
   setActiveOrg,
+  toolApiOriginForMcpUrl,
 } from "../context";
 
 describe("context management", () => {
@@ -194,6 +195,33 @@ describe("context management", () => {
     const matched = await findContextByMemoryUrl("http://localhost:8787/mcp");
 
     expect(matched?.name).toBe("local");
+  });
+
+  test("each context resolves the MCP URL its own installation serves", async () => {
+    const configData = {
+      currentContext: "lobu",
+      contexts: {
+        lobu: { url: "https://app.lobu.ai/api/v1" },
+        hosted: { url: "https://app.lobu.ai" },
+        selfhosted: { url: "https://lobu.example.test/api/v1" },
+        local: { url: "http://localhost:8787/api/v1" },
+        pinned: {
+          url: "https://lobu.example.test/api/v1",
+          memoryUrl: "https://memory.example.test/mcp",
+        },
+      },
+    };
+    readFileSpy.mockResolvedValue(JSON.stringify(configData));
+
+    expect(await getMemoryUrl("lobu")).toBe("https://lobu.ai/mcp");
+    expect(await getMemoryUrl("hosted")).toBe("https://lobu.ai/mcp");
+    expect(await getMemoryUrl("selfhosted")).toBe(
+      "https://lobu.example.test/mcp"
+    );
+    expect(await getMemoryUrl("local")).toBe("http://localhost:8787/mcp");
+    expect(await getMemoryUrl("pinned")).toBe(
+      "https://memory.example.test/mcp"
+    );
   });
 
   test("derives local memory URL from a loopback context URL", async () => {
@@ -503,5 +531,23 @@ describe("context management", () => {
     expect(config.contexts.local).toEqual({
       url: "http://localhost:8787/api/v1",
     });
+  });
+
+  test("tool API origin: the hosted MCP edge maps to the hosted gateway", () => {
+    expect(toolApiOriginForMcpUrl("https://lobu.ai/mcp")).toBe(
+      "https://app.lobu.ai"
+    );
+    expect(toolApiOriginForMcpUrl("https://lobu.ai/mcp/acme")).toBe(
+      "https://app.lobu.ai"
+    );
+    expect(toolApiOriginForMcpUrl("https://app.lobu.ai/mcp/acme")).toBe(
+      "https://app.lobu.ai"
+    );
+    expect(toolApiOriginForMcpUrl("http://localhost:8787/mcp")).toBe(
+      "http://localhost:8787"
+    );
+    expect(
+      toolApiOriginForMcpUrl("https://gateway.test/lobu/mcp/lobu-memory")
+    ).toBe("https://gateway.test");
   });
 });
