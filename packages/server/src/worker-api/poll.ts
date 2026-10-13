@@ -34,7 +34,14 @@ import {
 import {
   buildAutomationRunWorkerAccess,
   buildDeviceChatRunWorkerAccess,
+  DEVICE_CHAT_RUN_SOURCE,
 } from '../gateway/services/run-worker-access';
+import {
+  CHAT_SENDER_NOT_LINKED,
+  chatTurnEvidenceFrom,
+  resolveChatTurnActor,
+} from '../gateway/orchestration/chat-turn-actor';
+import { buildWorkerTokenClaims } from '../gateway/orchestration/worker-token-claims';
 import {
   readSnapshotJsonl,
   transcriptText,
@@ -1588,7 +1595,26 @@ export async function pollWorkerJob(c: Context<{ Bindings: Env }>) {
       token: string;
       expires_at: number;
     };
+    let confined = false;
     try {
+      const platform =
+        typeof message?.platform === 'string' ? message.platform : undefined;
+      const teamId =
+        typeof message?.teamId === 'string' ? message.teamId : undefined;
+      // The device turn's chat sender decides its authority, exactly as for a
+      // cloud chat turn. A local CLI cannot be confined to its own thread, so a
+      // sender without workspace access is refused a device session outright.
+      const actor = await resolveChatTurnActor({
+        organizationId: row.organization_id,
+        senderId: userId,
+        claims: {
+          ...buildWorkerTokenClaims({ channelId, platform, teamId, platformMetadata }),
+          source: DEVICE_CHAT_RUN_SOURCE,
+        },
+        evidence: chatTurnEvidenceFrom(platformMetadata),
+      });
+      confined = actor?.access === 'reply_only' || actor?.access === 'public_visitor';
+      if (confined) throw new Error(CHAT_SENDER_NOT_LINKED);
       const access = buildDeviceChatRunWorkerAccess({
         agentId: row.chat_agent_id,
         conversationId,
@@ -1596,11 +1622,11 @@ export async function pollWorkerJob(c: Context<{ Bindings: Env }>) {
         organizationId: row.organization_id,
         userId,
         channelId,
-        platform:
-          typeof message?.platform === 'string' ? message.platform : undefined,
-        teamId:
-          typeof message?.teamId === 'string' ? message.teamId : undefined,
+        platform,
+        teamId,
         platformMetadata,
+        actorUserId: actor?.actorUserId,
+        chatAccess: actor?.access,
       });
       agentSession = {
         conversation_id: access.conversationId,
@@ -1609,7 +1635,9 @@ export async function pollWorkerJob(c: Context<{ Bindings: Env }>) {
         expires_at: access.expiresAt,
       };
     } catch (err) {
-      const failure = 'failed to mint the required device chat run session';
+      const failure = confined
+        ? `device chat refused: ${CHAT_SENDER_NOT_LINKED}`
+        : 'failed to mint the required device chat run session';
       await failClaimedDeviceChatRun({
         runId: row.run_id,
         workerId: worker_id,

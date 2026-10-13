@@ -46,7 +46,17 @@ import {
 import {
   buildAgentSettingsUrl,
   buildProviderConnectUrl,
+  getOrganizationSlug,
 } from "../../utils/url-builder.js";
+import { getRateLimiter } from "../../utils/rate-limiter.js";
+import {
+  CHAT_ACCESS_NOTICE_WINDOW_SECONDS,
+  CHAT_TURN_EVIDENCE_KEYS,
+  chatAccessNotice,
+  chatSenderLimitKey,
+  resolveChatTurnActor,
+  UNLINKED_SENDER_TURNS_PER_HOUR,
+} from "../orchestration/chat-turn-actor.js";
 import { buildCtaCardPayload } from "../platform/link-buttons.js";
 import { stripPlatformPrefix } from "../channels/bound-channels.js";
 import { buildConversationUrl } from "./conversation-url.js";
@@ -465,6 +475,7 @@ export class MessageHandlerBridge {
       claim: claimAutomationCooldownStandalone,
       markZero: markZeroCooldownAutomationActivation,
     },
+    private resolveTurnActor: typeof resolveChatTurnActor = resolveChatTurnActor,
   ) {
     this.artifactStore = services.getArtifactStore();
     this.publicGatewayUrl = services.getPublicGatewayUrl();
@@ -1268,7 +1279,35 @@ export class MessageHandlerBridge {
       }
     );
 
+    // DM-ness for typed messages and clicks alike comes from ONE structured
+    // source: the Chat SDK thread's `isDM`, which the adapter derives from the
+    // thread id (`adapter.isDM`) — the same verdict that routes a typed message
+    // to `onDirectMessage`. A click carries the SDK thread it happened in.
+    // Absent (no SDK thread) is unknown, which fails closed downstream.
+    const isDirect: boolean | undefined =
+      typeof thread?.isDM === "boolean" ? thread.isDM : undefined;
     for (const target of directTargets) {
+      // Provider-authoritative same-tenant evidence, from the platform's own
+      // descriptor. Only meaningful for the connection's own organization: a
+      // preview bot's workspace says nothing about another org's tenant.
+      const senderVouched =
+        target.organizationId === this.connection.organizationId &&
+        getPlatformDescriptor(platform)?.senderIsSameTenant?.(
+          this.connection,
+          message.raw
+        ) === true;
+      if (
+        !(await this.admitChatSender({
+          organizationId: target.organizationId,
+          userId,
+          teamId,
+          isDirect: isDirect === true,
+          senderVouched,
+          thread,
+        }))
+      ) {
+        continue;
+      }
       await this.enqueueUserTurn({
         agentId: target.agentId,
         organizationId: target.organizationId,
@@ -1281,7 +1320,7 @@ export class MessageHandlerBridge {
             : messageId,
         messageText,
         isGroup,
-        isDirect: source === "interaction" ? undefined : !isGroup,
+        isDirect,
         thread,
         teamId,
         payloadTeamId:
@@ -1310,6 +1349,7 @@ export class MessageHandlerBridge {
             : {}),
           ...(ingestedFiles.length > 0 && { files: ingestedFiles }),
           ...(sessionReset && { sessionReset: true }),
+          ...(senderVouched && { [CHAT_TURN_EVIDENCE_KEYS.senderVouched]: true }),
         },
         spanName: routing?.spanName ?? "message_received",
         logMessage:
@@ -1325,6 +1365,88 @@ export class MessageHandlerBridge {
           .catch(() => undefined);
       }
     }
+  }
+
+  /**
+   * Gate an inbound turn on its sender's chat authority
+   * (orchestration/chat-turn-actor.ts) before it is queued. A linked member
+   * always passes, untouched. Every unlinked sender is rate-limited per
+   * organization + platform + sender through the shared Postgres-backed
+   * limiter; over the limit, the message gets no turn. A sender whose turn
+   * cannot use the workspace (reply-only, public visitor) is also told so by a
+   * fixed server-posted notice, at most once per notice window. The mint
+   * re-derives the same authority from the same evidence when it signs the
+   * turn's token.
+   */
+  private async admitChatSender(args: {
+    organizationId: string | undefined;
+    userId: string;
+    teamId: string | undefined;
+    isDirect: boolean;
+    senderVouched: boolean;
+    thread: any;
+  }): Promise<boolean> {
+    const platform = this.connection.platform;
+    const actor = await this.resolveTurnActor({
+      organizationId: args.organizationId,
+      senderId: args.userId,
+      claims: { platform, teamId: args.teamId },
+      evidence: { isDirectMessage: args.isDirect, senderVouched: args.senderVouched },
+    });
+    // Keyed on the sender being unlinked, not on the tier: a linked member in
+    // a group conversation is `org_shared` too, and is never limited.
+    if (!actor || actor.actorUserId) return true;
+
+    const sender = {
+      organizationId: args.organizationId,
+      platform,
+      teamId: args.teamId,
+      senderId: args.userId,
+    };
+    const limiter = getRateLimiter();
+    // Awaited against the shared counter: admission is already async, and a
+    // replica's empty cache must not admit turns another replica spent.
+    const turns = await limiter.consume(chatSenderLimitKey("turns", sender), {
+      limit: UNLINKED_SENDER_TURNS_PER_HOUR,
+      windowSeconds: 60 * 60,
+    });
+    if (!turns.allowed) {
+      logger.info(
+        { platform, organizationId: args.organizationId, connectionId: this.connection.id, access: actor.access },
+        "Unlinked chat sender is over its turn limit — no agent turn"
+      );
+      return false;
+    }
+
+    if (actor.access === "reply_only" || actor.access === "public_visitor") {
+      const notice = await limiter.consume(chatSenderLimitKey("notice", sender), {
+        limit: 1,
+        windowSeconds: CHAT_ACCESS_NOTICE_WINDOW_SECONDS,
+      });
+      if (notice.allowed) {
+        const slug =
+          actor.access === "public_visitor"
+            ? await getOrganizationSlug(args.organizationId).catch(() => null)
+            : null;
+        const joinUrl = slug
+          ? `${webOriginFromGateway(this.publicGatewayUrl)}/${encodeURIComponent(slug)}`
+          : null;
+        try {
+          await args.thread.post(chatAccessNotice(actor.access, joinUrl));
+          logger.info(
+            { platform, organizationId: args.organizationId, connectionId: this.connection.id, access: actor.access },
+            "Posted the chat access notice to an unlinked sender"
+          );
+        } catch (error) {
+          // The notice is advice; the turn still answers without it.
+          logger.warn(
+            { platform, connectionId: this.connection.id, error: String(error) },
+            "Failed to post the chat access notice"
+          );
+        }
+      }
+    }
+    return true;
   }
 
   /**
@@ -1348,9 +1470,8 @@ export class MessageHandlerBridge {
     messageText: string;
     isGroup: boolean;
     /**
-     * Authoritative inbound surface classification. Interaction clicks omit
-     * this: their conversationId/channelId relationship identifies threading,
-     * not whether the original surface was a DM or group channel.
+     * Authoritative DM flag from the SDK thread for messages and clicks.
+     * Absent when no SDK thread verdict is available.
      */
     isDirect?: boolean;
     thread: any;
