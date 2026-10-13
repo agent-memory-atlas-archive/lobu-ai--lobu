@@ -23,7 +23,13 @@ export type { ContentItem };
  */
 export const GetContentResultSchema = Type.Object({
   content: Type.Array(Type.Unknown()),
-  total: Type.Integer(),
+  /**
+   * Reported match count (account activity reports page size; query rewrites
+   * report the fetched candidate pool). null when `include_total: false`
+   * on a read that honors it (date/score listings and search); `page.has_more`
+   * is then computed without counting.
+   */
+  total: Type.Union([Type.Integer(), Type.Null()]),
   /**
    * content_ids reads only. `total` counts returned rows (a supersede chain
    * expands to all its rows); `chain_total` counts the distinct lineages those

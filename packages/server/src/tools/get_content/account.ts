@@ -14,7 +14,7 @@ import type { ContentRow, GetContentResult } from './types';
 const AccountContentSchema = Type.Pick(GetContentSchema, [
   'client_ids', 'mcp_activity_id', 'content_ids', 'limit', 'offset',
   'before_occurred_at', 'before_id', 'after_occurred_at', 'after_id',
-  'sort_by', 'sort_order', 'include_classification',
+  'sort_by', 'sort_order', 'include_classification', 'include_total',
 ]);
 type AccountContentArgs = Static<typeof AccountContentSchema>;
 type AccountContentContext = Pick<AuthContext,
@@ -120,8 +120,9 @@ async function readAccountContent(
   });
   return {
     content,
-    // Like the chronological workspace reader, avoid counting growing history.
-    total: content.length,
+    // Account activity reports page size by default; exact-ID reads retain
+    // that count even when the caller opts out, as the shared schema promises.
+    total: !exact && args.include_total === false ? null : content.length,
     page: { limit, offset: 0, has_more: hasMore,
       has_older: after ? true : hasMore,
       has_newer: after ? hasMore : before },
