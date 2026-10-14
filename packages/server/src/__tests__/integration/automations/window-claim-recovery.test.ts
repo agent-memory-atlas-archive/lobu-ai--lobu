@@ -210,7 +210,6 @@ describe('Automation window claim and recovery', () => {
     const local = await claim({ run_id: first.run_id, limit: 2,
       before_occurred_at: first.context.page.next_cursor?.occurred_at,
       before_id: first.context.page.next_cursor?.id });
-    await expect(complete([first.context.window_token, local.context.window_token])).rejects.toThrow(/missing|Incomplete/);
     const alpha = await claim({ run_id: first.run_id, limit: 2, source_name: 'alpha', source_cursor: first.context.window_token });
     const beta = await claim({ run_id: first.run_id, limit: 2, source_name: 'İşler 🌍', source_cursor: first.context.window_token });
     const betaEnd = await claim({ run_id: first.run_id, limit: 2, source_name: 'İşler 🌍', source_cursor: beta.context.window_token });
@@ -225,12 +224,30 @@ describe('Automation window claim and recovery', () => {
     const [row] = await sql`SELECT a.next_window_start, r.run_metadata FROM automations a JOIN runs r ON r.id = ${first.run_id} WHERE a.id = ${automationId}`;
     expect(new Date(row.next_window_start).toISOString()).toBe(first.context.window_end);
     expect(row.run_metadata.source_coverage).toEqual([
-      { name: 'alpha', feed_id: feeds[0], axis: 'source_at', rows: 3 },
-      { name: 'İşler 🌍', feed_id: feeds[1], axis: 'source_at', rows: 5 },
+      { name: 'alpha', feed_id: feeds[0], axis: 'source_at', rows: 3, complete: true },
+      { name: 'İşler 🌍', feed_id: feeds[1], axis: 'source_at', rows: 5, complete: true },
     ]);
     const [persisted] = await sql`SELECT count(*)::int AS n FROM events WHERE feed_id IN (${feeds[0]}, ${feeds[1]})`;
     expect(persisted.n).toBe(0);
   }, 30_000);
+
+  it('records partial live-source coverage when advancing the window', async () => {
+    const feeds = await addLiveSources();
+    const first = await claim({ limit: 2 });
+    expect(first.context.sources_page?.alpha.has_more).toBe(true);
+    expect(first.context.sources_page?.['İşler 🌍'].has_more).toBe(true);
+    await expect(api.automations.completeWindow({
+      automation_id: String(automationId), run_id: first.run_id,
+      window_token: first.context.window_token, extracted_data: { signals: [] },
+    })).resolves.toMatchObject({ completed_now: true, content_linked: 0 });
+    const [row] = await sql`SELECT a.next_window_start, r.run_metadata FROM automations a
+      JOIN runs r ON r.id = ${first.run_id} WHERE a.id = ${automationId}`;
+    expect(new Date(row.next_window_start).toISOString()).toBe(first.context.window_end);
+    expect(row.run_metadata.source_coverage).toEqual([
+      { name: 'alpha', feed_id: feeds[0], axis: 'source_at', rows: 2, complete: false },
+      { name: 'İşler 🌍', feed_id: feeds[1], axis: 'source_at', rows: 2, complete: false },
+    ]);
+  });
 
   async function queuedLiveRun() {
     await addLiveSources();
@@ -261,9 +278,9 @@ describe('Automation window claim and recovery', () => {
   it('rejects a legacy unbound receipt that omits a queued run live sources', async () => {
     const run = await queuedLiveRun();
     // A valid receipt from an earlier, event-only read of the same range must
-    // not substitute for the current run's required live source traversal.
+    // not substitute for the current run's pinned live source roster.
     const token = await generateWindowToken({ automation_id: automationId, window_start: run.windowStart,
-      window_end: run.windowEnd, content_count: 0, content_ids: [], page_has_more: false }, ENV);
+      window_end: run.windowEnd, content_count: 0, content_ids: [] }, ENV);
     await expect(api.automations.completeWindow({ automation_id: String(automationId), run_id: run.runId,
       window_token: token, extracted_data: { signals: [] } })).rejects.toThrow(/run-bound|source/i);
     const [after] = await sql`SELECT next_window_start FROM automations WHERE id = ${automationId}`;
@@ -713,13 +730,13 @@ describe('Automation window claim and recovery', () => {
     expect(replay).toMatchObject({ run_id: current.run_id, completed_now: false });
   });
 
-  it('requires every bounded source page before completing the logical window', async () => {
+  it('completes a window the agent read only partly and advances the mark', async () => {
     const start = dayStart(1);
     for (let index = 0; index < 3; index++) {
       await createTestEvent({
         entity_id: entityId,
         organization_id: orgId,
-        content: `Paged source ${index}`,
+        content: `Partly read source ${index}`,
         occurred_at: new Date(start.getTime() + (index + 1) * 3_600_000),
       });
     }
@@ -733,18 +750,32 @@ describe('Automation window claim and recovery', () => {
         window_token: first.context.window_token,
         extracted_data: { signals: [] },
       })
-    ).rejects.toThrow(/More Automation source pages remain/);
-    const [afterPartialPage] = await sql`
+    ).resolves.toMatchObject({ completed_now: true, content_linked: 2 });
+    const [afterPartialRead] = await sql`
       SELECT a.next_window_start, r.status
       FROM automations a
       JOIN runs r ON r.id = ${first.run_id}
       WHERE a.id = ${automationId}
     `;
-    expect(new Date(afterPartialPage.next_window_start).toISOString()).toBe(
-      first.context.window_start
+    expect(new Date(afterPartialRead.next_window_start).toISOString()).toBe(
+      first.context.window_end
     );
-    expect(afterPartialPage.status).toBe('running');
+    expect(afterPartialRead.status).toBe('completed');
+  });
 
+  it('requires the latest lease token alongside earlier source pages', async () => {
+    const start = dayStart(1);
+    for (let index = 0; index < 3; index++) {
+      await createTestEvent({
+        entity_id: entityId,
+        organization_id: orgId,
+        content: `Paged source ${index}`,
+        occurred_at: new Date(start.getTime() + (index + 1) * 3_600_000),
+      });
+    }
+
+    const first = await claim({ limit: 2 });
+    expect(first.context.page.has_more).toBe(true);
     const cursor = first.context.page.next_cursor;
     expect(cursor).toBeDefined();
     const second = await claim({
@@ -784,7 +815,7 @@ describe('Automation window claim and recovery', () => {
     ).resolves.toMatchObject({ completed_now: true, content_linked: 3 });
   });
 
-  it('fails closed when a non-pageable auxiliary source is truncated', async () => {
+  it('completes when a non-pageable auxiliary source is truncated', async () => {
     for (let index = 0; index < 3; index++) {
       await createTestEntity({
         name: `Auxiliary context ${index}`,
@@ -830,21 +861,21 @@ describe('Automation window claim and recovery', () => {
         window_token: truncated.context.window_token,
         extracted_data: { signals: [] },
       })
-    ).rejects.toThrow(/context_rows.*cannot be completed safely/);
+    ).resolves.toMatchObject({ completed_now: true });
 
-    const [afterRejectedCompletion] = await sql`
+    const [afterCompletion] = await sql`
       SELECT a.next_window_start, r.status
       FROM automations a
       JOIN runs r ON r.id = ${truncated.run_id}
       WHERE a.id = ${Number(created.automation_id)}
     `;
-    expect(new Date(afterRejectedCompletion.next_window_start).toISOString()).toBe(
-      truncated.context.window_start
+    expect(new Date(afterCompletion.next_window_start).toISOString()).toBe(
+      truncated.context.window_end
     );
-    expect(afterRejectedCompletion.status).toBe('running');
+    expect(afterCompletion.status).toBe('completed');
   });
 
-  it('fails closed when a truncated non-event source is named content', async () => {
+  it('completes when a truncated non-event source is named content', async () => {
     for (let index = 0; index < 3; index++) {
       await createTestEntity({
         name: `Named content context ${index}`,
@@ -886,7 +917,7 @@ describe('Automation window claim and recovery', () => {
         window_token: truncated.context.window_token,
         extracted_data: { signals: [] },
       })
-    ).rejects.toThrow(/content.*cannot be completed safely/);
+    ).resolves.toMatchObject({ completed_now: true });
   });
 
   // Coverage on the arrival axis is ONE contiguous range, so there are no holes
