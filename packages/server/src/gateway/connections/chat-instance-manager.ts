@@ -450,6 +450,13 @@ export class ChatInstanceManager {
     if (!descriptor && !isAdapterlessPlatform(platform)) {
       throw new Error(`Unsupported platform: ${platform}`);
     }
+    // A connector-transport platform rides an existing connector connection;
+    // the chat path never mints one.
+    if (descriptor?.connectorTransport) {
+      throw new Error(
+        `${platform} chat runs on its connector connection; create that connection instead`,
+      );
+    }
     if (config.platform !== platform) {
       throw new Error(
 				`Config platform mismatch: expected ${platform}, got ${config.platform}`,
@@ -971,7 +978,18 @@ export class ChatInstanceManager {
         `No active chat instance for connection ${connectionId} (could not start it on this pod)`,
       );
     }
-    const thread = await instance.chat.openDM(platformUserId);
+    // The connection already identifies the adapter. SDK user-id inference
+    // only recognizes its built-in formats, not connector-owned addresses.
+    const adapter = instance.chat.getAdapter(instance.connection.platform);
+    if (!adapter?.openDM) {
+      throw new Error(`${instance.connection.platform} does not support direct messages`);
+    }
+    const threadId = await adapter.openDM(platformUserId);
+    const thread = await resolveChatTarget(instance.chat, instance.connection.platform, {
+      channelId: threadId,
+      responseThreadId: threadId,
+    });
+    if (!thread) throw new Error(`Could not resolve direct message target ${threadId}`);
     const sent = (await thread.post(content)) as {
       id?: unknown;
       threadId?: unknown;
@@ -1850,6 +1868,7 @@ export class ChatInstanceManager {
       ? `${this.publicGatewayUrl}/api/v1/webhooks/${connection.id}`
       : undefined;
     const adapter = await descriptor.createAdapter(connection.config, {
+      connection,
       webhookUrl: runtime?.webhookUrl ?? webhookUrl,
       onWebhookAccepted: descriptor.onWebhookAccepted ? async (request) => {
         const stored = await this.runtimeDeps().getConnection(connection.id);
@@ -1996,6 +2015,7 @@ export class ChatInstanceManager {
     } catch (error) {
       if (existing) await this.stopInstance(id);
       logger.warn({ id, error: String(error) }, "Chat installation is unavailable");
+      if (getPlatformDescriptor(stored.platform)?.connectorTransport) throw error;
       return false;
     }
     if (existing && existing.rowVersion === stored.updatedAt &&
@@ -2017,6 +2037,10 @@ export class ChatInstanceManager {
         { id, error: String(error) },
 				"Failed to hydrate connection",
       );
+      // Source ingress acknowledges false as an intentional off-state. A
+      // startup outage must instead reach its durable queue for retry; the
+      // connector also owns status writes for this row.
+      if (getPlatformDescriptor(stored.platform)?.connectorTransport) throw error;
       await this.writeConnectionStatus(
         stored,
         "error",
@@ -2825,6 +2849,7 @@ function storedToPlatform(stored: StoredConnection): PlatformConnection {
   };
   if (stored.agentId) out.agentId = stored.agentId;
   if (stored.organizationId) out.organizationId = stored.organizationId;
+  if (stored.createdBy) out.createdBy = stored.createdBy;
   if (stored.errorMessage) out.errorMessage = stored.errorMessage;
   return out;
 }

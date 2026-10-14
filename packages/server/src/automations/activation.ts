@@ -9,7 +9,7 @@ import { DEVICE_CHAT_MAX_CONTEXT_LENGTH } from "@lobu/core/contracts/worker/prot
 import type { DbClient } from "../db/client";
 import { getDb } from "../db/client";
 import { authorizedChatLinkIds } from "../gateway/channels/chat-link-authorization";
-import { runtimeConnectionIdToSlug } from "../lobu/stores/connections-projection";
+import { runtimeConnectionPredicate } from "../lobu/stores/connections-projection";
 import {
   type AutomationEventRunQueued,
   createAutomationEventRun,
@@ -83,6 +83,33 @@ export function buildAutomationTurnContext(
   ].join("\n");
 }
 
+/** A trigger whose turn answers in the conversation its message came from. */
+function repliesToSource(trigger: AutomationEventTrigger): boolean {
+  return resolvedEventExecution(trigger) === "turn" &&
+    (trigger.output ?? "silent") === "reply_to_source";
+}
+
+/**
+ * Whether routing an Automation on a reference-only signal needs the message
+ * read first: some trigger matching everything but its `match` filters either
+ * replies to the source or has filters, which name content (chat, mention)
+ * the reference does not carry. The read message is matched again in full.
+ */
+export function needsSourceMessage(
+  triggers: AutomationTrigger[],
+  signal: ConnectorTriggerSignal,
+): boolean {
+  const contentTriggers = triggers.filter(
+    (trigger): trigger is AutomationEventTrigger =>
+      trigger.kind === "event" && trigger.source !== "workspace" &&
+      (repliesToSource(trigger) || Object.keys(trigger.match ?? {}).length > 0),
+  );
+  return matchingAutomationTriggers(
+    contentTriggers.map((trigger) => ({ ...trigger, match: undefined })),
+    signal,
+  ).length > 0;
+}
+
 /**
  * Split matching Automations once, at the connector-neutral activation seam.
  * Reply targets stay with the chat transport so they retain thread history,
@@ -107,12 +134,7 @@ export function planAutomationActivations(
       (match.agentKind != null &&
         buildAutomationTurnContext(match).length <=
           DEVICE_CHAT_MAX_CONTEXT_LENGTH);
-    if (
-      match.agentId != null &&
-      canUseDeviceChat &&
-      resolvedEventExecution(match.trigger) === "turn" &&
-      (match.trigger.output ?? "silent") === "reply_to_source"
-    ) {
+    if (match.agentId != null && canUseDeviceChat && repliesToSource(match.trigger)) {
       replyTargets.push({ ...match, agentId: match.agentId });
     } else {
       backgroundTargets.push(match);
@@ -241,19 +263,23 @@ export async function findMatchingAutomationActivations(
 /**
  * Resolve a Chat SDK runtime id to the integer connection id used by Automation
  * triggers, then perform the normal connector-neutral match. Runtime ids are
- * deliberately stable slugs (for example `slackinst-…`), not database ids.
+ * stable slugs (for example `slackinst-…`), or a connector-transport row's id.
  */
 export async function planAutomationActivationsForRuntimeConnection(
   args: RuntimeConnectionAutomationLookup,
   db: DbClient = getDb(),
 ): Promise<AutomationActivationPlan> {
   const connections = await db<{ id: number }>`
-		SELECT id
-		FROM connections
-		WHERE organization_id = ${args.connectionOrganizationId}
-		  AND slug = ${runtimeConnectionIdToSlug(args.runtimeConnectionId)}
-		  AND connector_key = ${args.signal.connector_key}
-		  AND deleted_at IS NULL
+		SELECT c.id
+		FROM connections c
+		WHERE c.organization_id = ${args.connectionOrganizationId}
+		  AND ${runtimeConnectionPredicate(db, args.runtimeConnectionId, {
+				id: db`c.id`,
+				slug: db`c.slug`,
+				credentialMode: db`c.credential_mode`,
+			})}
+		  AND c.connector_key = ${args.signal.connector_key}
+		  AND c.deleted_at IS NULL
 		LIMIT 1
   `;
   const connectionId = connections[0]?.id;

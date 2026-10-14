@@ -851,34 +851,34 @@ export class ChatResponseBridge implements ResponseRenderer {
         );
 
         if (linkButtons.length > 0) {
+          const fallbackText = `${processedContent}\n\n${linkButtons.map((button) => `${button.text}: ${button.url}`).join("\n")}`;
+          const card = Card({
+            children: [
+              CardText(processedContent),
+              Actions(
+                linkButtons.map((button) =>
+                  LinkButton({ url: button.url, label: button.text })
+                )
+              ),
+            ],
+          });
           try {
-            const card = Card({
-              children: [
-                CardText(processedContent),
-                Actions(
-                  linkButtons.map((button) =>
-                    LinkButton({ url: button.url, label: button.text })
-                  )
-                ),
-              ],
-            });
-            await target.post({
-              card,
-              fallbackText: `${processedContent}\n\n${linkButtons.map((button) => `${button.text}: ${button.url}`).join("\n")}`,
-            });
+            await this.postContent(ctx, payload, target, { card, fallbackText });
             return;
           } catch (error) {
+            // A strategy-owned send may have been delivered before it failed,
+            // so a second post of the same notice could duplicate it.
+            if (ctx.strategy.post) throw error;
             logger.warn(
               { connectionId, error: String(error) },
               "Failed to render ephemeral settings button"
             );
-            const fallbackText = `${processedContent}\n\n${linkButtons.map((button) => `${button.text}: ${button.url}`).join("\n")}`;
-            await target.post(fallbackText.trim());
+            await this.postContent(ctx, payload, target, fallbackText.trim());
             return;
           }
         }
 
-        await target.post(processedContent);
+        await this.postContent(ctx, payload, target, processedContent);
       }
     } catch (error) {
       logger.error(
@@ -921,10 +921,22 @@ export class ChatResponseBridge implements ResponseRenderer {
   ): Promise<void> {
     try {
       const target = await this.resolveTargetForPayload(ctx, payload);
-      if (target) await target.post(content);
+      if (target) await this.postContent(ctx, payload, target, content);
     } catch (err) {
       logger.error({ connectionId: ctx.connectionId, err: String(err) }, logMessage);
     }
+  }
+
+  /** Post through the strategy when it owns delivery, else the SDK target. */
+  private postContent(
+    ctx: ResponseContext,
+    payload: ThreadResponsePayload,
+    target: any,
+    content: unknown
+  ): Promise<unknown> {
+    return ctx.strategy.post
+      ? ctx.strategy.post({ ctx, threadId: target.id, messageId: payload.messageId, content })
+      : target.post(content);
   }
 
   /**

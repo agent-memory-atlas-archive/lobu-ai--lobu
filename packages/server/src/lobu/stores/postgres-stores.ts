@@ -6,12 +6,13 @@ import type {
 } from "@lobu/core";
 import { createLogger } from "@lobu/core";
 import { resolveNewAgentProvisioningDefaults } from "../../auth/system-provider-resolution";
-import { getDb, tsTime, tsTimeOrNull } from "../../db/client";
+import { getDb, pgTextArray, tsTime, tsTimeOrNull } from "../../db/client";
 import { recordLifecycleEvent } from "../../utils/insert-event";
 import {
 	chatTenantAdvisoryLockKey,
 	connectionsRowToStored,
 	managedTenantAdvisoryLockKey,
+	isConnectionRowRuntimeId,
 	runtimeConnectionIdToSlug,
 	softDeleteChatConnectionProjection,
 	upsertChatConnectionProjection,
@@ -351,11 +352,62 @@ export function createPostgresAgentConfigStore(): AgentConfigStore {
 	return store;
 }
 
-export function createPostgresAgentConnectionStore(): AgentConnectionStore {
+/**
+ * A connector connection (credential_mode NULL) joins the chat store when its
+ * platform is a declared connector transport AND its active connector
+ * definition declares an Automation event that can reply to its source. Both
+ * are declarations: the gateway's (it can run that transport) and the
+ * connector's (its messages can be answered where they came from).
+ */
+const CONNECTOR_TRANSPORT_ROW_SQL = `c.credential_mode IS NULL
+	AND c.connector_key = ANY($1::text[])
+	AND EXISTS (
+		SELECT 1 FROM connector_definitions d
+		WHERE d.organization_id = c.organization_id
+		  AND d.key = c.connector_key
+		  AND d.status = 'active'
+		  AND d.automation_events @> '[{"capabilities":{"replyToSource":true}}]'::jsonb
+	)`;
+
+/** A connector-transport row's runtime id is its numeric `connections.id`. */
+function connectionRowToStored(row: Record<string, any>) {
+	const stored = connectionsRowToStored(row);
+	return row.credential_mode == null ? { ...stored, id: String(row.id) } : stored;
+}
+
+export function createPostgresAgentConnectionStore(
+	options: {
+		/** Platforms whose transport is a connector connection (see the descriptor). */
+		connectorTransportPlatforms?: readonly string[];
+	} = {},
+): AgentConnectionStore {
+	const transportPlatforms = [...(options.connectorTransportPlatforms ?? [])];
+	const transportArray = pgTextArray(transportPlatforms);
+	function assertChatOwned(platform: string): void {
+		if (transportPlatforms.includes(platform)) {
+			throw new Error(
+				`${platform} connections are owned by their connector and are not written by the chat store`,
+			);
+		}
+	}
 	return {
 		async getConnection(connectionId) {
 			const sql = getDb();
 			const orgId = tryGetOrgId();
+			// A connector-transport row's runtime id is numeric. New chat slugs are
+			// never numeric, but a legacy one may be, so a miss here still falls
+			// through to the slug lookup below.
+			if (transportPlatforms.length > 0 && isConnectionRowRuntimeId(connectionId)) {
+				const rows = await sql.unsafe(
+					`SELECT c.* FROM connections c
+					 WHERE c.id = $2::bigint AND c.deleted_at IS NULL
+					   AND ($3::text IS NULL OR c.organization_id = $3)
+					   AND ${CONNECTOR_TRANSPORT_ROW_SQL}
+					 LIMIT 1`,
+					[transportArray, connectionId, orgId ?? null],
+				);
+				if (rows.length > 0) return connectionRowToStored(rows[0]);
+			}
 			// `connections` is the sole source of truth (chat rows carry a non-null
 			// credential_mode; data connectors leave it NULL). Keyed by slug.
 			const slug = runtimeConnectionIdToSlug(connectionId);
@@ -406,9 +458,26 @@ export function createPostgresAgentConnectionStore(): AgentConnectionStore {
           ${platform ? sql`AND connector_key = ${platform}` : sql``}
         ORDER BY created_at DESC
       `;
-			return projRows.map(connectionsRowToStored);
+			const stored = projRows.map(connectionsRowToStored);
+			// Connector-transport rows carry no agent binding of their own, so an
+			// agent-scoped list never includes them.
+			if (transportPlatforms.length === 0 || agentId) return stored;
+			if (platform && !transportPlatforms.includes(platform)) return stored;
+			const transportRows = await sql.unsafe(
+				`SELECT c.* FROM connections c
+				 WHERE c.deleted_at IS NULL
+				   AND ($2::text IS NULL OR c.organization_id = $2)
+				   AND ($3::text IS NULL OR c.connector_key = $3)
+				   AND ${CONNECTOR_TRANSPORT_ROW_SQL}
+				 ORDER BY c.created_at DESC`,
+				[transportArray, orgId ?? null, platform],
+			);
+			return [...stored, ...transportRows.map(connectionRowToStored)];
 		},
 		async saveConnection(connection) {
+			// The connector owns its connection row; a chat projection written over
+			// it would mint a second, credentialed row under a BYO slug.
+			assertChatOwned(connection.platform);
 			const sql = getDb();
 			const orgId = getOrgId();
 			const slug = runtimeConnectionIdToSlug(connection.id);
@@ -524,10 +593,13 @@ export function createPostgresAgentConnectionStore(): AgentConnectionStore {
 		async updateConnection(connectionId, updates) {
 			const existing = await this.getConnection(connectionId);
 			if (!existing) return;
+			assertChatOwned(existing.platform);
 			const merged = { ...existing, ...updates, updatedAt: Date.now() };
 			await this.saveConnection(merged);
 		},
 		async deleteConnection(connectionId) {
+			const existing = await this.getConnection(connectionId);
+			if (existing) assertChatOwned(existing.platform);
 			const sql = getDb();
 			const orgId = tryGetOrgId();
 			// `connections` is the sole source of truth — soft-delete (`deleted_at`)
