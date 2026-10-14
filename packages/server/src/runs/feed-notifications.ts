@@ -3,7 +3,7 @@ import { FeedSourceAckSchema, type PollRequest } from '@lobu/core/contracts/work
 import { Value } from '@sinclair/typebox/value';
 import type { DbClient, DbQuery } from '../db/client';
 import { pgTextArray } from '../db/client';
-import { feedBackoff } from '../connectors/feed-backoff';
+import { feedRetryAtSql } from '../connectors/feed-backoff';
 import { feedDefinitionSelection } from '../connectors/feed-definition-selection';
 import { feedTriggerEligibilitySql } from '../connectors/feed-health-semantics';
 import { notifyWorkerWork } from './worker-wakeup';
@@ -119,10 +119,9 @@ export async function requestFeedSync(sql: DbClient, selection: DbQuery) {
     UPDATE feeds f
     SET next_run_at = CASE
           WHEN f.consecutive_failures = 0 THEN LEAST(f.next_run_at, current_timestamp)
-          ELSE COALESCE(f.next_run_at, current_timestamp +
-            (LEAST(${feedBackoff.maxMs}::bigint,
-              ${feedBackoff.baseMs}::bigint * (2 ^ LEAST(GREATEST(f.consecutive_failures - 1, 0), 30))::bigint
-            ) || ' milliseconds')::interval)
+          -- The delay the latest failure already armed, not the next one's.
+          ELSE COALESCE(f.next_run_at,
+            ${feedRetryAtSql(sql, sql`GREATEST(f.consecutive_failures - 1, 0)`)})
         END,
         updated_at = current_timestamp
     WHERE f.id IN (${selection}) AND f.status = 'active' AND f.deleted_at IS NULL
@@ -181,8 +180,8 @@ export async function receiveFeedNotifications(
         );
       }
       if (notice.changed) {
-        // Never use a live event to defeat failure backoff. A manual feed that
-        // failed has no cron retry, so retain one bounded retry for its buffer.
+        // Never use a live event to defeat failure backoff: a failed feed keeps
+        // the retry its failure armed, and only one with none gets a bounded one.
         await requestFeedSync(tx, tx`
           SELECT id FROM feeds WHERE id = ${notice.feed_id}
         `);
